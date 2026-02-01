@@ -4,18 +4,26 @@ const axios = require("axios");
 const admin = require("firebase-admin");
 
 /**
+ * VeroTasks Backend (Render)
+ * - Telegram webhook (tarefas + botões)
+ * - Office API (/office/signal) protegido por secret
+ * - Admin API (/admin/createUser) protegido por secret
+ * - TV endpoint (/tv/tasks)
+ * - Health endpoint (/health)
+ *
  * ENV obrigatórias:
  * - TELEGRAM_BOT_TOKEN
- * - TELEGRAM_WEBHOOK_SECRET   (string inventada)
- * - BASE_URL                  (https://seuapp.onrender.com)
+ * - TELEGRAM_WEBHOOK_SECRET
+ * - BASE_URL
  * - FIREBASE_SERVICE_ACCOUNT  (JSON do service account)
+ * - MASTER_CHAT_ID            (chat_id do privado do master)
+ * - OFFICE_API_SECRET         (secret para o painel Office sinalizar)
+ * - ADMIN_API_SECRET          (secret para criar usuários)
  *
- * ENV opcionais/novas:
- * - OFFICE_CHAT_ID            (-100... do grupo do escritório)
- * - MASTER_CHAT_ID            (chat_id do master no privado)
- * - OFFICE_API_SECRET         (senha longa para o Web chamar /office/*)
+ * ENV opcionais:
+ * - OFFICE_CHAT_ID            (chat_id do grupo do escritório)
  * - CORS_ORIGINS              (csv: http://localhost:5173,https://verotasks.netlify.app)
- * - PORT                      (Render injeta)
+ * - PORT
  */
 
 const {
@@ -28,9 +36,13 @@ const {
 
   MASTER_CHAT_ID,
   OFFICE_API_SECRET,
+  ADMIN_API_SECRET,
   CORS_ORIGINS,
 } = process.env;
 
+// =========================
+// Validations
+// =========================
 if (!TELEGRAM_BOT_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 if (!TELEGRAM_WEBHOOK_SECRET) throw new Error("Missing TELEGRAM_WEBHOOK_SECRET");
 if (!BASE_URL) throw new Error("Missing BASE_URL");
@@ -38,29 +50,45 @@ if (!FIREBASE_SERVICE_ACCOUNT) throw new Error("Missing FIREBASE_SERVICE_ACCOUNT
 
 if (!MASTER_CHAT_ID) throw new Error("Missing MASTER_CHAT_ID");
 if (!OFFICE_API_SECRET) throw new Error("Missing OFFICE_API_SECRET");
+if (!ADMIN_API_SECRET) throw new Error("Missing ADMIN_API_SECRET");
 
+// =========================
+// Firebase Admin
+// =========================
 const serviceAccount = JSON.parse(FIREBASE_SERVICE_ACCOUNT);
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+}
 
 const db = admin.firestore();
 const tasksCol = db.collection("tasks");
-const awaitingCol = db.collection("awaiting_details"); // docId=userId (fluxo "feito c/ detalhes" do escritório)
-const awaitingMasterCol = db.collection("awaiting_master_comment"); // docId=userId (master vai responder)
 
+// aguardando detalhe do "feito c/ detalhes" (operador do escritório)
+const awaitingCol = db.collection("awaiting_details"); // docId=userId
+
+// aguardando comentário do master (responder)
+const awaitingMasterCol = db.collection("awaiting_master_comment"); // docId=userId
+
+// =========================
+// Telegram client
+// =========================
 const tg = axios.create({
   baseURL: `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`,
   timeout: 20000,
 });
 
+// =========================
+// Express app
+// =========================
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-/* =========================
-   CORS (para Netlify + dev)
-   ========================= */
+// =========================
+// CORS (Netlify + dev)
+// =========================
 const allowedOrigins = String(CORS_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -69,17 +97,25 @@ const allowedOrigins = String(CORS_ORIGINS || "")
 app.use((req, res, next) => {
   const origin = req.headers.origin;
 
-  if (origin && allowedOrigins.includes(origin)) {
+  // Se não configurou allowlist, não aplica CORS (server-to-server ok)
+  // Se configurou, só libera os origins listados
+  if (origin && (allowedOrigins.length === 0 || allowedOrigins.includes(origin))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type,X-Office-Secret");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type,X-Office-Secret,X-Admin-Secret"
+    );
   }
 
   if (req.method === "OPTIONS") return res.status(204).send("");
   next();
 });
 
+// =========================
+// Helpers
+// =========================
 function nowTS() {
   return admin.firestore.Timestamp.now();
 }
@@ -96,8 +132,13 @@ function userLabel(from = {}) {
   return name || from.username || String(from.id || "usuario");
 }
 
+function verifyWebhookSecret(req) {
+  const secret = req.headers["x-telegram-bot-api-secret-token"];
+  return secret === TELEGRAM_WEBHOOK_SECRET;
+}
+
 function inferPriority(text = "") {
-  const t = text.toLowerCase();
+  const t = String(text || "").toLowerCase();
   const high = [
     "urgente",
     "agora",
@@ -132,6 +173,7 @@ function badgeStatus(s) {
   return map[s] || `<b>${escapeHtml(s)}</b>`;
 }
 
+// signals padronizados (office)
 function badgeOfficeSignal(sig) {
   const map = {
     em_andamento: "🛠️ <b>EM ANDAMENTO</b>",
@@ -140,6 +182,12 @@ function badgeOfficeSignal(sig) {
     comentario: "💬 <b>COMENTÁRIO</b>",
   };
   return map[sig] || (sig ? `<b>${escapeHtml(sig)}</b>` : "—");
+}
+
+function normalizeOfficeSignal(sig) {
+  const s = String(sig || "").trim();
+  if (["em_andamento", "ajuda", "deu_ruim", "comentario"].includes(s)) return s;
+  return null;
 }
 
 function taskCardText(taskId, t) {
@@ -155,7 +203,9 @@ function taskCardText(taskId, t) {
   // bloco do escritório (sinal / comentário)
   let officeBlock = "";
   if (t.officeSignal) {
-    const when = t.officeSignaledAt?.toDate ? t.officeSignaledAt.toDate().toLocaleString("pt-BR") : "—";
+    const when = t.officeSignaledAt?.toDate
+      ? t.officeSignaledAt.toDate().toLocaleString("pt-BR")
+      : "—";
     officeBlock =
       `\n\n<b>Sinal do escritório:</b> ${badgeOfficeSignal(t.officeSignal)}\n` +
       `<b>Em:</b> ${escapeHtml(when)}` +
@@ -165,7 +215,9 @@ function taskCardText(taskId, t) {
   // último comentário do master (se existir)
   let masterBlock = "";
   if (t.masterComment) {
-    const when = t.masterCommentAt?.toDate ? t.masterCommentAt.toDate().toLocaleString("pt-BR") : "—";
+    const when = t.masterCommentAt?.toDate
+      ? t.masterCommentAt.toDate().toLocaleString("pt-BR")
+      : "—";
     masterBlock =
       `\n\n<b>Resposta do master:</b>\n${escapeHtml(t.masterComment)}\n<b>Em:</b> ${escapeHtml(when)}`;
   }
@@ -182,9 +234,8 @@ function taskCardText(taskId, t) {
     masterBlock
   );
 }
-
 /* =========================
-   Keyboards
+   Keyboards (Inline)
    ========================= */
 
 function mainKeyboard(taskId) {
@@ -253,13 +304,8 @@ async function tgAnswerCallback(callbackQueryId, text = "Ok ✅") {
   if (!data.ok) throw new Error(`answerCallbackQuery failed: ${JSON.stringify(data)}`);
 }
 
-function verifyWebhookSecret(req) {
-  const secret = req.headers["x-telegram-bot-api-secret-token"];
-  return secret === TELEGRAM_WEBHOOK_SECRET;
-}
-
 /* =========================
-   Awaiting helpers
+   Awaiting helpers (Firestore)
    ========================= */
 
 async function setAwaiting(userId, taskId) {
@@ -288,6 +334,89 @@ async function popAwaitingMaster(userId) {
   return data;
 }
 
+/* =========================
+   Office/Admin API security
+   ========================= */
+
+function requireOfficeAuth(req, res, next) {
+  const secret = req.headers["x-office-secret"];
+  if (!secret || String(secret) !== String(OFFICE_API_SECRET)) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  next();
+}
+
+function requireAdminAuth(req, res, next) {
+  const secret = req.headers["x-admin-secret"];
+  if (!secret || String(secret) !== String(ADMIN_API_SECRET)) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  next();
+}
+
+/* =========================
+   Helpers: refresh office card
+   ========================= */
+
+async function refreshOfficeCard(taskId) {
+  const ref = tasksCol.doc(taskId);
+  const snap = await ref.get();
+  if (!snap.exists) return;
+
+  const t = snap.data();
+  if (!t.office?.chatId || !t.office?.messageId) return;
+
+  const closing = t.status === "feito" || t.status === "feito_detalhes" || t.status === "deu_ruim";
+  const kb = closing ? { inline_keyboard: [] } : mainKeyboard(taskId);
+
+  await tgEditMessage(t.office.chatId, t.office.messageId, taskCardText(taskId, t), { reply_markup: kb });
+}
+
+/* =========================
+   Admin API: create user
+   - cria usuário no Firebase Auth
+   - grava perfil/permissão no Firestore
+   ========================= */
+
+app.post("/admin/createUser", requireAdminAuth, async (req, res) => {
+  try {
+    const { email, password, name, role = "office" } = req.body || {};
+    if (!email || !password) {
+      return res.status(400).json({ ok: false, error: "missing_email_or_password" });
+    }
+
+    const user = await admin.auth().createUser({
+      email: String(email).trim().toLowerCase(),
+      password: String(password),
+      displayName: name ? String(name).slice(0, 80) : undefined,
+    });
+
+    // Claims (role)
+    await admin.auth().setCustomUserClaims(user.uid, { role });
+
+    // Profile Firestore
+    await db.collection("users").doc(user.uid).set(
+      {
+        uid: user.uid,
+        email: user.email,
+        name: name ? String(name).slice(0, 80) : null,
+        role,
+        status: "active",
+        createdAt: nowTS(),
+      },
+      { merge: true }
+    );
+
+    return res.json({ ok: true, uid: user.uid, email: user.email, role });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (msg.includes("email-already-exists")) {
+      return res.status(409).json({ ok: false, error: "email_exists" });
+    }
+    console.error("admin/createUser error:", msg);
+    return res.status(500).json({ ok: false, error: msg });
+  }
+});
 /* =========================
    Commands
    ========================= */
@@ -320,37 +449,93 @@ async function handleCommand(message) {
 }
 
 /* =========================
-   Office API security
+   Master validation (CORRIGIDO)
+   - valida pelo chat onde o botão foi clicado
    ========================= */
 
-function requireOfficeAuth(req, res, next) {
-  const secret = req.headers["x-office-secret"];
-  if (!secret || String(secret) !== String(OFFICE_API_SECRET)) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-  next();
+function isMasterCallback(cb) {
+  const chatId = cb?.message?.chat?.id;
+  return String(chatId || "") === String(MASTER_CHAT_ID);
 }
 
 /* =========================
-   Helpers: refresh office card
+   Save / finalize helpers
    ========================= */
 
-async function refreshOfficeCard(taskId) {
+async function finalizeWithDetails(taskId, from, detailsText) {
   const ref = tasksCol.doc(taskId);
   const snap = await ref.get();
   if (!snap.exists) return;
 
+  const operatorName = userLabel(from);
+
+  await ref.update({
+    details: String(detailsText || "").slice(0, 4000),
+    status: "feito_detalhes",
+    closedAt: nowTS(),
+    closedBy: { userId: from.id, name: operatorName },
+    audit: admin.firestore.FieldValue.arrayUnion({
+      at: nowTS(),
+      by: { userId: from.id, name: operatorName },
+      action: "details",
+      meta: { len: String(detailsText || "").length },
+    }),
+  });
+
+  const updated = (await ref.get()).data();
+
+  // atualiza card do escritório e remove botões
+  if (updated.office?.chatId && updated.office?.messageId) {
+    await tgEditMessage(updated.office.chatId, updated.office.messageId, taskCardText(taskId, updated), {
+      reply_markup: { inline_keyboard: [] },
+    });
+  }
+
+  // notifica solicitante
+  const createdChatId = updated.createdBy?.chatId;
+  if (createdChatId) {
+    await tgSendMessage(
+      createdChatId,
+      `📣 Sua tarefa <code>${taskId}</code> foi concluída com detalhes.\n✅ Status: ${badgeStatus(updated.status)}`
+    );
+  }
+}
+
+async function saveMasterComment(taskId, from, commentText) {
+  const ref = tasksCol.doc(taskId);
+  const snap = await ref.get();
+  if (!snap.exists) return;
+
+  const masterName = userLabel(from);
   const t = snap.data();
-  if (!t.office?.chatId || !t.office?.messageId) return;
 
-  const closing = t.status === "feito" || t.status === "feito_detalhes" || t.status === "deu_ruim";
-  const kb = closing ? { inline_keyboard: [] } : mainKeyboard(taskId);
+  await ref.update({
+    masterComment: String(commentText || "").slice(0, 2000),
+    masterCommentAt: nowTS(),
+    audit: admin.firestore.FieldValue.arrayUnion({
+      at: nowTS(),
+      by: { userId: from.id, name: masterName },
+      action: "master_comment",
+      meta: { len: String(commentText || "").length },
+    }),
+  });
 
-  await tgEditMessage(t.office.chatId, t.office.messageId, taskCardText(taskId, t), { reply_markup: kb });
+  // avisa o escritório
+  if (t.office?.chatId) {
+    await tgSendMessage(
+      t.office.chatId,
+      `💬 <b>Master respondeu</b>\n` +
+        `🧾 Tarefa <code>${taskId}</code>\n\n` +
+        `${escapeHtml(commentText)}`
+    );
+  }
+
+  // atualiza card do escritório
+  await refreshOfficeCard(taskId);
 }
 
 /* =========================
-   Main handlers
+   Main handler: incoming message
    ========================= */
 
 async function handleMessage(message) {
@@ -367,8 +552,15 @@ async function handleMessage(message) {
   }
 
   // 1) master está aguardando uma resposta/comentário?
+  // OBS: Aqui valida pelo userId do master (mensagem no privado)
   const awaitingMaster = await popAwaitingMaster(from.id);
   if (awaitingMaster?.taskId) {
+    // (recomendado: impedir outros users de injetar comentário)
+    if (String(chatId) !== String(MASTER_CHAT_ID)) {
+      await tgSendMessage(chatId, "🚫 Apenas o Master pode responder tarefas por aqui.");
+      return;
+    }
+
     await saveMasterComment(awaitingMaster.taskId, from, text);
     await tgSendMessage(chatId, "✅ Resposta enviada ao escritório e registrada na tarefa.");
     return;
@@ -382,15 +574,19 @@ async function handleMessage(message) {
     return;
   }
 
-  // criar task no Firestore
+  // 3) criar task no Firestore
   const priority = inferPriority(text);
   const createdByName = userLabel(from);
+
+  const officeTargetChatId = OFFICE_CHAT_ID ? Number(OFFICE_CHAT_ID) : chatId;
 
   const ref = await tasksCol.add({
     createdAt: nowTS(),
     createdBy: { chatId, userId: from.id, name: createdByName },
     source: { chatId, messageId: message.message_id, text },
-    office: { chatId: OFFICE_CHAT_ID ? Number(OFFICE_CHAT_ID) : chatId, messageId: null },
+
+    office: { chatId: officeTargetChatId, messageId: null },
+
     priority,
     status: "aberta",
     details: "",
@@ -401,6 +597,7 @@ async function handleMessage(message) {
     officeSignal: "",
     officeComment: "",
     officeSignaledAt: null,
+
     masterComment: "",
     masterCommentAt: null,
 
@@ -413,7 +610,7 @@ async function handleMessage(message) {
 
   await tgSendMessage(chatId, `✅ Tarefa registrada. ID: <code>${taskId}</code>`);
 
-  // postar no escritório (ou no mesmo chat se OFFICE_CHAT_ID não estiver definido)
+  // postar no escritório
   const taskSnap = await ref.get();
   const t = taskSnap.data();
 
@@ -431,6 +628,10 @@ async function handleMessage(message) {
     }),
   });
 }
+
+/* =========================
+   Callback handler
+   ========================= */
 
 async function handleCallback(cb) {
   await tgAnswerCallback(cb.id);
@@ -453,11 +654,10 @@ async function handleCallback(cb) {
   const officeMessageId = t.office?.messageId;
 
   // =====================
-  // MASTER callbacks
+  // MASTER callbacks (CORRIGIDO)
   // =====================
   if (action === "mstatus") {
-    // só master
-    if (String(cb.from?.id || "") !== String(MASTER_CHAT_ID)) return;
+    if (!isMasterCallback(cb)) return; // valida pelo chat.id do callback
 
     if (!["pendente", "feito", "deu_ruim"].includes(value)) return;
 
@@ -467,9 +667,12 @@ async function handleCallback(cb) {
       status: value,
       closedAt: closing ? nowTS() : null,
       closedBy: { userId: cb.from.id, name: operatorName, via: "master" },
-      // limpa sinal do escritório após decisão
+
+      // limpa sinal do escritório após decisão do master
       officeSignal: "",
       officeComment: "",
+      officeSignaledAt: null,
+
       audit: admin.firestore.FieldValue.arrayUnion({
         at: nowTS(),
         by: { userId: cb.from.id, name: operatorName },
@@ -493,7 +696,7 @@ async function handleCallback(cb) {
       );
     }
 
-    // feedback pro escritório (mensagem simples)
+    // feedback no grupo do escritório
     if (officeChatId) {
       await tgSendMessage(
         officeChatId,
@@ -507,13 +710,15 @@ async function handleCallback(cb) {
   }
 
   if (action === "mcomment") {
-    // só master
-    if (String(cb.from?.id || "") !== String(MASTER_CHAT_ID)) return;
+    if (!isMasterCallback(cb)) return; // valida pelo chat.id do callback
 
     await setAwaitingMaster(cb.from.id, taskId);
 
+    // responde no chat do master (onde o botão foi clicado)
+    const masterChatId = cb?.message?.chat?.id || MASTER_CHAT_ID;
+
     await tgSendMessage(
-      cb.message?.chat?.id || MASTER_CHAT_ID,
+      masterChatId,
       `💬 <b>Responder tarefa</b>\n` +
         `Tarefa: <code>${taskId}</code>\n` +
         `Envie UMA mensagem com sua resposta. Vou mandar ao escritório e salvar na tarefa.`
@@ -522,10 +727,10 @@ async function handleCallback(cb) {
   }
 
   // =====================
-  // OFFICE callbacks (do card do grupo do escritório)
+  // OFFICE callbacks
   // =====================
 
-  // segurança: só deixa mexer no card do escritório
+  // segurança: só deixa mexer no card do escritório (evita clique em forward/outro chat)
   if (cb.message?.chat?.id && String(cb.message.chat.id) !== String(officeChatId)) return;
 
   if (action === "prio") {
@@ -628,81 +833,8 @@ async function handleCallback(cb) {
     }
   }
 }
-
-async function finalizeWithDetails(taskId, from, detailsText) {
-  const ref = tasksCol.doc(taskId);
-  const snap = await ref.get();
-  if (!snap.exists) return;
-
-  const operatorName = userLabel(from);
-
-  await ref.update({
-    details: detailsText,
-    status: "feito_detalhes",
-    closedAt: nowTS(),
-    closedBy: { userId: from.id, name: operatorName },
-    audit: admin.firestore.FieldValue.arrayUnion({
-      at: nowTS(),
-      by: { userId: from.id, name: operatorName },
-      action: "details",
-      meta: { len: String(detailsText || "").length },
-    }),
-  });
-
-  const updated = (await ref.get()).data();
-
-  // atualiza card do escritório e remove botões
-  if (updated.office?.chatId && updated.office?.messageId) {
-    await tgEditMessage(updated.office.chatId, updated.office.messageId, taskCardText(taskId, updated), {
-      reply_markup: { inline_keyboard: [] },
-    });
-  }
-
-  // notifica solicitante
-  const createdChatId = updated.createdBy?.chatId;
-  if (createdChatId) {
-    await tgSendMessage(
-      createdChatId,
-      `📣 Sua tarefa <code>${taskId}</code> foi concluída com detalhes.\n✅ Status: ${badgeStatus(updated.status)}`
-    );
-  }
-}
-
-async function saveMasterComment(taskId, from, commentText) {
-  const ref = tasksCol.doc(taskId);
-  const snap = await ref.get();
-  if (!snap.exists) return;
-
-  const masterName = userLabel(from);
-  const t = snap.data();
-
-  await ref.update({
-    masterComment: commentText,
-    masterCommentAt: nowTS(),
-    audit: admin.firestore.FieldValue.arrayUnion({
-      at: nowTS(),
-      by: { userId: from.id, name: masterName },
-      action: "master_comment",
-      meta: { len: String(commentText || "").length },
-    }),
-  });
-
-  // avisa o escritório
-  if (t.office?.chatId) {
-    await tgSendMessage(
-      t.office.chatId,
-      `💬 <b>Master respondeu</b>\n` +
-        `🧾 Tarefa <code>${taskId}</code>\n\n` +
-        `${escapeHtml(commentText)}`
-    );
-  }
-
-  // atualiza card do escritório
-  await refreshOfficeCard(taskId);
-}
-
 /* =========================
-   Office API: sinalizar (Web -> Bot)
+   Office API: sinalizar tarefa (Web -> Bot -> Master)
    ========================= */
 
 app.post("/office/signal", requireOfficeAuth, async (req, res) => {
@@ -713,14 +845,16 @@ app.post("/office/signal", requireOfficeAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing taskId/signal" });
     }
 
-    const normalizedSignal = String(signal || "").trim();
-    if (!["em_andamento", "ajuda", "deu_ruim", "comentario"].includes(normalizedSignal)) {
+    const normalizedSignal = normalizeOfficeSignal(signal);
+    if (!normalizedSignal) {
       return res.status(400).json({ ok: false, error: "invalid signal" });
     }
 
     const ref = tasksCol.doc(String(taskId));
     const snap = await ref.get();
-    if (!snap.exists) return res.status(404).json({ ok: false, error: "task not found" });
+    if (!snap.exists) {
+      return res.status(404).json({ ok: false, error: "task_not_found" });
+    }
 
     const t = snap.data();
 
@@ -732,14 +866,17 @@ app.post("/office/signal", requireOfficeAuth, async (req, res) => {
         at: nowTS(),
         by: { userId: "office", name: String(byEmail || "office-web") },
         action: "office_signal",
-        meta: { signal: normalizedSignal, hasComment: Boolean(comment) },
+        meta: {
+          signal: normalizedSignal,
+          hasComment: Boolean(comment),
+        },
       }),
     });
 
-    // atualiza card do escritório para refletir sinal
+    // atualiza card do escritório
     await refreshOfficeCard(taskId);
 
-    // notifica master com botões de decisão
+    // notifica Master com botões de decisão
     const masterText =
       `📣 <b>Escritório sinalizou</b>\n` +
       `🧾 Tarefa: <code>${taskId}</code>\n` +
@@ -747,24 +884,25 @@ app.post("/office/signal", requireOfficeAuth, async (req, res) => {
       (comment ? `\n💬 <b>Comentário:</b>\n${escapeHtml(comment)}` : "") +
       `\n\nO que você quer fazer?`;
 
-    await tgSendMessage(MASTER_CHAT_ID, masterText, { reply_markup: masterKeyboard(taskId) });
+    await tgSendMessage(MASTER_CHAT_ID, masterText, {
+      reply_markup: masterKeyboard(taskId),
+    });
 
     return res.json({ ok: true });
   } catch (e) {
     console.error("office/signal error:", e?.message || e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
 /* =========================
-   TV endpoint
+   TV endpoint (Painel TV)
    ========================= */
 
 app.get("/tv/tasks", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 50), 200);
 
-    // pendentes / abertas para exibir na TV
     const snap = await tasksCol
       .where("status", "in", ["aberta", "pendente"])
       .orderBy("createdAt", "desc")
@@ -789,19 +927,43 @@ app.get("/tv/tasks", async (req, res) => {
     res.json({ ok: true, items });
   } catch (e) {
     console.error("tv/tasks error:", e?.message || e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
 /* =========================
-   Health + Telegram webhook
+   Health check (Render)
    ========================= */
 
 app.get("/", (_, res) => res.status(200).send("ok"));
 
+app.get("/health", async (req, res) => {
+  try {
+    // ping simples no Firestore (opcional, mas garante env ok)
+    await db.collection("_health").doc("ping").set({ at: nowTS() }, { merge: true });
+
+    res.json({
+      ok: true,
+      service: "verotasks-backend",
+      now: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: String(e?.message || e),
+    });
+  }
+});
+
+/* =========================
+   Telegram Webhook
+   ========================= */
+
 app.post("/telegram/webhook", async (req, res) => {
   try {
-    if (!verifyWebhookSecret(req)) return res.status(401).send("unauthorized");
+    if (!verifyWebhookSecret(req)) {
+      return res.status(401).send("unauthorized");
+    }
 
     const update = req.body;
 
@@ -810,10 +972,14 @@ app.post("/telegram/webhook", async (req, res) => {
 
     res.status(200).send("ok");
   } catch (e) {
-    console.error("webhook error:", e?.message || e, e?.response?.data);
+    console.error("telegram webhook error:", e?.message || e, e?.response?.data);
     res.status(200).send("ok");
   }
 });
+
+/* =========================
+   Telegram Webhook control
+   ========================= */
 
 app.post("/telegram/setWebhook", async (req, res) => {
   try {
@@ -824,7 +990,11 @@ app.post("/telegram/setWebhook", async (req, res) => {
     });
     res.json(data);
   } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message, details: e?.response?.data });
+    res.status(500).json({
+      ok: false,
+      error: e?.message,
+      details: e?.response?.data,
+    });
   }
 });
 
@@ -833,19 +1003,25 @@ app.post("/telegram/deleteWebhook", async (req, res) => {
     const { data } = await tg.post("/deleteWebhook", {});
     res.json(data);
   } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message, details: e?.response?.data });
+    res.status(500).json({
+      ok: false,
+      error: e?.message,
+      details: e?.response?.data,
+    });
   }
 });
 
 /* =========================
-   Listen
+   Listen (Render)
    ========================= */
 
 const listenPort = Number(PORT || 8080);
+
 app.listen(listenPort, () => {
-  console.log(`Server online :${listenPort}`);
-  console.log(`BASE_URL: ${BASE_URL}`);
-  console.log(`OFFICE_CHAT_ID: ${OFFICE_CHAT_ID || "(nao definido - usando o mesmo chat)"}`);
-  console.log(`MASTER_CHAT_ID: ${MASTER_CHAT_ID}`);
-  console.log(`CORS_ORIGINS: ${allowedOrigins.join(",") || "(vazio)"}`);
+  console.log(`✅ VeroTasks Backend online`);
+  console.log(`→ Port: ${listenPort}`);
+  console.log(`→ BASE_URL: ${BASE_URL}`);
+  console.log(`→ OFFICE_CHAT_ID: ${OFFICE_CHAT_ID || "(mesmo chat do solicitante)"}`);
+  console.log(`→ MASTER_CHAT_ID: ${MASTER_CHAT_ID}`);
+  console.log(`→ CORS_ORIGINS: ${allowedOrigins.join(",") || "(livre)"}`);
 });
