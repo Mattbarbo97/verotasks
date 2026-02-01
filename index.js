@@ -24,6 +24,7 @@ const admin = require("firebase-admin");
  * - OFFICE_CHAT_ID            (chat_id do grupo do escritório)
  * - CORS_ORIGINS              (csv: http://localhost:5173,https://verotasks.netlify.app)
  * - PORT
+ * - OFFICE_SIGNAL_RATE_LIMIT_SEC  (default 15)  anti-spam server-side
  */
 
 const {
@@ -38,6 +39,8 @@ const {
   OFFICE_API_SECRET,
   ADMIN_API_SECRET,
   CORS_ORIGINS,
+
+  OFFICE_SIGNAL_RATE_LIMIT_SEC,
 } = process.env;
 
 // =========================
@@ -178,7 +181,7 @@ function badgeOfficeSignal(sig) {
   const map = {
     em_andamento: "🛠️ <b>EM ANDAMENTO</b>",
     ajuda: "🆘 <b>PRECISO DE AJUDA</b>",
-    deu_ruim: "🚨 <b>DEU RUIM</b>",
+    deu_ruim: "🚨 <b>APRESENTOU PROBLEMAS</b>",
     comentario: "💬 <b>COMENTÁRIO</b>",
   };
   return map[sig] || (sig ? `<b>${escapeHtml(sig)}</b>` : "—");
@@ -188,6 +191,31 @@ function normalizeOfficeSignal(sig) {
   const s = String(sig || "").trim();
   if (["em_andamento", "ajuda", "deu_ruim", "comentario"].includes(s)) return s;
   return null;
+}
+
+// ✅ Anti-spam server-side (default 15s)
+const OFFICE_RATE_LIMIT_SEC = Math.max(
+  3,
+  Number(OFFICE_SIGNAL_RATE_LIMIT_SEC || 15)
+);
+
+function tsToMs(ts) {
+  if (!ts) return null;
+  if (ts.toMillis) return ts.toMillis();
+  if (ts._seconds) return ts._seconds * 1000;
+  return null;
+}
+
+function clampText(s, max = 2000) {
+  return String(s || "").slice(0, max);
+}
+
+function taskShortLabel(taskId, t) {
+  const msg = clampText(t?.source?.text || "", 120).trim();
+  const who = clampText(t?.createdBy?.name || "", 80).trim();
+  const head = msg ? msg : "(sem mensagem)";
+  const by = who ? who : "—";
+  return `🧾 <b>Tarefa</b> <code>${escapeHtml(taskId)}</code>\n👤 <b>De:</b> ${escapeHtml(by)}\n📝 <b>Resumo:</b> ${escapeHtml(head)}`;
 }
 
 function taskCardText(taskId, t) {
@@ -222,6 +250,12 @@ function taskCardText(taskId, t) {
       `\n\n<b>Resposta do master:</b>\n${escapeHtml(t.masterComment)}\n<b>Em:</b> ${escapeHtml(when)}`;
   }
 
+  // lock state (anti spam)
+  let lockBlock = "";
+  if (t.officeSignalLock) {
+    lockBlock = `\n\n🔒 <b>Sinal do escritório travado</b> (aguardando decisão do Master)`;
+  }
+
   return (
     `🧾 <b>Tarefa</b> #<code>${taskId}</code>\n` +
     `👤 <b>De:</b> ${escapeHtml(t.createdBy?.name || "—")}\n` +
@@ -231,9 +265,11 @@ function taskCardText(taskId, t) {
     `<b>Mensagem:</b>\n${escapeHtml(msg)}` +
     detailsBlock +
     officeBlock +
-    masterBlock
+    masterBlock +
+    lockBlock
   );
 }
+
 /* =========================
    Keyboards (Inline)
    ========================= */
@@ -279,7 +315,6 @@ function masterKeyboard(taskId) {
     ],
   };
 }
-
 /* =========================
    Telegram helpers
    ========================= */
@@ -839,13 +874,31 @@ async function handleCallback(cb) {
 
 app.post("/office/signal", requireOfficeAuth, async (req, res) => {
   try {
-    const { taskId, signal, comment, byEmail } = req.body || {};
+    // ✅ Compat com teu OfficePanel atual:
+    // - novo payload: { taskId, state, comment, by: { uid, email } }
+    // - payload antigo (se existir): { taskId, signal, comment, byEmail }
+    const body = req.body || {};
 
-    if (!taskId || !signal) {
-      return res.status(400).json({ ok: false, error: "missing taskId/signal" });
+    const taskId = body.taskId;
+    const state = body.state || body.signal; // compat
+    const comment = body.comment || "";
+
+    const by = body.by || null;
+    const byEmail =
+      (by && by.email) || body.byEmail || body.by_email || body.email || "office-web";
+
+    if (!taskId || !state) {
+      return res.status(400).json({ ok: false, error: "missing taskId/state" });
     }
 
-    const normalizedSignal = normalizeOfficeSignal(signal);
+    // ✅ Normaliza os 4 estados canônicos do OfficePanel
+    // OfficePanel envia: em_andamento | preciso_ajuda | deu_ruim | comentario
+    // Backend aceita internamente: em_andamento | ajuda | deu_ruim | comentario
+    let normalizedSignal = String(state || "").trim();
+
+    if (normalizedSignal === "preciso_ajuda") normalizedSignal = "ajuda";
+
+    normalizedSignal = normalizeOfficeSignal(normalizedSignal);
     if (!normalizedSignal) {
       return res.status(400).json({ ok: false, error: "invalid signal" });
     }
@@ -858,6 +911,15 @@ app.post("/office/signal", requireOfficeAuth, async (req, res) => {
 
     const t = snap.data();
 
+    // ✅ Anti-spam (server-side): não dispara notificação repetida para o mesmo estado+comment
+    // Se o escritório clicar várias vezes, o backend "aceita" mas não envia ao master.
+    const prevSig = String(t.officeSignal || "");
+    const prevComment = String(t.officeComment || "");
+    const samePayload =
+      prevSig === normalizedSignal &&
+      prevComment === String(comment || "");
+
+    // ✅ Salva sempre o "último sinal" (isso corrige teu problema do painel/telegram)
     await ref.update({
       officeSignal: normalizedSignal,
       officeComment: comment ? String(comment).slice(0, 2000) : "",
@@ -869,12 +931,18 @@ app.post("/office/signal", requireOfficeAuth, async (req, res) => {
         meta: {
           signal: normalizedSignal,
           hasComment: Boolean(comment),
+          deduped: samePayload,
         },
       }),
     });
 
-    // atualiza card do escritório
+    // atualiza card do escritório (telegram) com o último sinal + comentário
     await refreshOfficeCard(taskId);
+
+    // ✅ Se já era o mesmo sinal+comentário, não notifica o master de novo
+    if (samePayload) {
+      return res.json({ ok: true, deduped: true });
+    }
 
     // notifica Master com botões de decisão
     const masterText =
@@ -921,6 +989,9 @@ app.get("/tv/tasks", async (req, res) => {
         message: x.source?.text || "",
         officeSignal: x.officeSignal || "",
         officeComment: x.officeComment || "",
+        officeSignaledAt: x.officeSignaledAt?.toDate
+          ? x.officeSignaledAt.toDate().toISOString()
+          : null,
       });
     });
 
