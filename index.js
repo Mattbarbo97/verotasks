@@ -1,9 +1,10 @@
-// index.js (FULL) — CORRIGIDO (PARTE 1/4)
+// index.js (FULL) — CORRIGIDO (PARTE 1/5)
 // ✅ Auth lock (Telegram ↔ Firebase) + Office link token + base hardening
-// - Parte 1/4: setup, CORS, helpers, auth, link-token, admin/createUser
-// - Parte 2/4: /office/signal + helpers de task + refresh card
-// - Parte 3/4: comandos /start /id /link + message handler + create task
-// - Parte 4/4: callbacks (office/master), webhook, health, setWebhook, boot
+// - Parte 1/5: setup, CORS, helpers, auth, link-token, admin/createUser
+// - Parte 2/5: text helpers + keyboards + refreshOfficeCard
+// - Parte 3/5: /office/signal (SEM LOCK) + notify master
+// - Parte 4/5: comandos /start /id /link + handleMessage + create task
+// - Parte 5/5: finalize + callbacks + webhook + health + setWebhook + boot
 
 require("dotenv").config();
 const express = require("express");
@@ -56,7 +57,7 @@ if (!ADMIN_API_SECRET) throw new Error("Missing ADMIN_API_SECRET");
 let serviceAccount;
 try {
   serviceAccount = JSON.parse(FIREBASE_SERVICE_ACCOUNT);
-} catch (e) {
+} catch {
   throw new Error("FIREBASE_SERVICE_ACCOUNT is not valid JSON");
 }
 
@@ -103,10 +104,7 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Content-Type,X-Office-Secret,X-Admin-Secret"
-    );
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,X-Office-Secret,X-Admin-Secret");
   }
 
   if (req.method === "OPTIONS") return res.status(204).send("");
@@ -180,8 +178,7 @@ async function tgSendMessage(chatId, text, opts = {}) {
     if (!data.ok) throw new Error(`sendMessage failed: ${JSON.stringify(data)}`);
     return data.result;
   } catch (e) {
-    const info = telegramErrorInfo(e);
-    console.error("tg sendMessage error:", info);
+    console.error("tg sendMessage error:", telegramErrorInfo(e));
     throw e;
   }
 }
@@ -199,8 +196,7 @@ async function tgEditMessage(chatId, messageId, text, opts = {}) {
     if (!data.ok) throw new Error(`editMessageText failed: ${JSON.stringify(data)}`);
     return data.result;
   } catch (e) {
-    const info = telegramErrorInfo(e);
-    console.error("tg editMessageText error:", info);
+    console.error("tg editMessageText error:", telegramErrorInfo(e));
     throw e;
   }
 }
@@ -211,8 +207,7 @@ async function tgAnswerCallback(callbackQueryId, text = "Ok ✅") {
     const { data } = await tg.post("/answerCallbackQuery", payload);
     if (!data.ok) throw new Error(`answerCallbackQuery failed: ${JSON.stringify(data)}`);
   } catch (e) {
-    const info = telegramErrorInfo(e);
-    console.error("tg answerCallbackQuery error:", info);
+    console.error("tg answerCallbackQuery error:", telegramErrorInfo(e));
     throw e;
   }
 }
@@ -266,7 +261,7 @@ function requireAdminAuth(req, res, next) {
 }
 
 // =========================
-// ✅ AUTH LOCK (Telegram) — CORRIGIDO
+// ✅ AUTH LOCK (Telegram)
 // =========================
 function isPrivilegedChat(chatId) {
   if (String(chatId || "") === String(MASTER_CHAT_ID)) return true;
@@ -295,7 +290,7 @@ async function findUserByTelegramUserId(telegramUserId) {
 }
 
 /**
- * ✅ Agora: precisa estar vinculado E no mesmo chat vinculado
+ * ✅ Precisa estar vinculado E no mesmo chat vinculado
  * Retornos:
  * - { ok:true, bypass:true } (master/office chat)
  * - { ok:true, user }
@@ -323,9 +318,7 @@ async function ensureTelegramLinkedOrThrow(message) {
 }
 
 // =========================
-// ✅ Link token helpers — CORRIGIDO
-// - TTL 10min
-// - 1x (apaga após uso)
+// ✅ Link token helpers (TTL 10min, 1x)
 // =========================
 function makeLinkToken(len = 6) {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -472,14 +465,11 @@ app.post("/admin/createUser", requireAdminAuth, async (req, res) => {
   }
 });
 
-// ⛔ Continua na PARTE 2/4:
-// - POST /office/signal (com X-Office-Secret) + notificação master
-// - helpers de atualizar task/audit + refreshOfficeCard
-// index.js (FULL) — CORRIGIDO (PARTE 2/4)
-// ✅ Office signal route + helpers de task/audit + refresh card
-// - Parte 2/4: /office/signal (header X-Office-Secret), aplica officeSignal no Firestore,
-//   envia notificação ao Master, e refresca card do escritório (editMessage).
-// - Mantém lock anti-spam (officeSignalLock) e não deixa sinalizar task fechada.
+// ⛔ Continua na PARTE 2/5
+// index.js (FULL) — CORRIGIDO (PARTE 2/5)
+// ✅ Text helpers + keyboards + refreshOfficeCard
+// - Parte 2/5: inferPriority/badges, taskCardText, keyboards e refreshOfficeCard
+// - Parte 3/5: /office/signal (SIMPLIFICADO — SEM LOCK) + notify master
 
 const { FieldValue } = admin.firestore;
 
@@ -623,7 +613,7 @@ function masterKeyboard(taskId) {
         { text: "✅ Concluir", callback_data: `mstatus:${taskId}:feito` },
         { text: "⏳ Pendente", callback_data: `mstatus:${taskId}:pendente` },
       ],
-      [{ text: "🚫 Apresentou problemas", callback_data: `mstatus:${taskId}:deu_ruim` }],
+      [{ text: "🚫 Deu ruim", callback_data: `mstatus:${taskId}:deu_ruim` }],
       [{ text: "💬 Responder", callback_data: `mcomment:${taskId}` }],
     ],
   };
@@ -648,40 +638,57 @@ async function refreshOfficeCard(taskId) {
   });
 }
 
+// ⛔ Continua na PARTE 3/5
+// - notifyMasterAboutOfficeSignal
+// - POST /office/signal (SIMPLIFICADO — SEM LOCK)
+// index.js (FULL) — CORRIGIDO (PARTE 3/5)
+// ✅ Office signal SIMPLIFICADO
+// - Escritório apenas sinaliza (ação rápida)
+// - SEM lock visual complexo
+// - Master é o único que fecha/move para finalizadas
+// - UI fica limpa: “Aguardando decisão do Master”
+
 /* =========================
    Helper: notify master
    ========================= */
-async function notifyMasterAboutOfficeSignal({ taskId, t, state, comment, byEmail }) {
-  const createdByName = t?.createdBy?.name ? safeStr(t.createdBy.name) : "—";
-  const prio = t?.priority ? safeStr(t.priority) : "media";
-  const msg = t?.source?.text ? safeStr(t.source.text) : "—";
+async function notifyMasterAboutOfficeSignal({
+  taskId,
+  t,
+  state,
+  comment,
+  byEmail,
+}) {
+  const createdByName = t?.createdBy?.name || "—";
+  const prio = t?.priority || "media";
+  const msg = t?.source?.text || "—";
 
-  const officeLine =
-    `🧾 <b>Sinal do Escritório</b>\n` +
-    `• tarefa: <code>${escapeHtml(taskId)}</code>\n` +
-    `• de: <b>${escapeHtml(createdByName)}</b>\n` +
-    `• prioridade: ${badgePriority(prio)}\n` +
-    `• sinal: ${officeSignalLabel(state)}\n` +
-    (byEmail ? `• por: <b>${escapeHtml(byEmail)}</b>\n` : "") +
+  const text =
+    `🧾 <b>Sinal do Escritório</b>\n\n` +
+    `• Tarefa: <code>${escapeHtml(taskId)}</code>\n` +
+    `• Criada por: <b>${escapeHtml(createdByName)}</b>\n` +
+    `• Prioridade: ${badgePriority(prio)}\n` +
+    `• Sinal: ${officeSignalLabel(state)}\n` +
+    (byEmail ? `• Por: <b>${escapeHtml(byEmail)}</b>\n` : "") +
     (comment ? `\n<b>Comentário:</b>\n${escapeHtml(comment)}\n` : "") +
     `\n<b>Mensagem original:</b>\n${escapeHtml(msg)}`;
 
-  await tgSendMessage(MASTER_CHAT_ID, officeLine, {
+  await tgSendMessage(MASTER_CHAT_ID, text, {
     reply_markup: masterKeyboard(taskId),
   });
 }
 
 /* =========================
-   ✅ Office API: signal task
-   - protegido por x-office-secret
-   - payload: { taskId, state, comment?, by? {uid,email} }
-   - atualiza Firestore: officeSignal + officeComment + officeSignaledAt
-   - opcional: lock (para travar spam), default false
-   - notifica master (telegram)
-   ========================= */
+   ✅ Office API: /office/signal (SIMPLIFICADO)
+   =========================
+   - NÃO fecha tarefa
+   - NÃO muda status final
+   - Apenas grava o sinal do escritório
+   - Master decide via Telegram
+*/
 app.post("/office/signal", requireOfficeAuth, async (req, res) => {
   try {
-    const { taskId, state, comment = "", by = null, lock = false } = req.body || {};
+    const { taskId, state, comment = "", by = null } = req.body || {};
+
     const taskIdStr = String(taskId || "").trim();
     const stateStr = String(state || "").trim();
     const commentStr = String(comment || "").slice(0, 2000);
@@ -690,7 +697,6 @@ app.post("/office/signal", requireOfficeAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing_taskId_or_state" });
     }
 
-    // valida estados permitidos
     const allowedStates = new Set([
       "em_andamento",
       "preciso_ajuda",
@@ -698,31 +704,29 @@ app.post("/office/signal", requireOfficeAuth, async (req, res) => {
       "tarefa_executada",
       "comentario",
     ]);
+
     if (!allowedStates.has(stateStr)) {
       return res.status(400).json({ ok: false, error: "invalid_state" });
     }
 
-    const byEmail = safeStr(by?.email || "office-web");
-    const byUid = safeStr(by?.uid || "office-web");
-
     const ref = tasksCol.doc(taskIdStr);
     const snap = await ref.get();
+
     if (!snap.exists) {
       return res.status(404).json({ ok: false, error: "task_not_found" });
     }
 
     const t = snap.data() || {};
-    const closed = isClosedStatus(t.status);
-    if (closed) {
-      return res.status(409).json({ ok: false, error: "task_closed" });
+
+    if (isClosedStatus(t.status)) {
+      return res.status(409).json({ ok: false, error: "task_already_closed" });
     }
 
-    // anti-spam: se já tem lock, não aceita novas sinalizações
-    if (t.officeSignalLock) {
-      return res.status(409).json({ ok: false, error: "office_signal_locked" });
-    }
+    const byEmail = safeStr(by?.email || "office-web");
+    const byUid = safeStr(by?.uid || "office-web");
 
-    const patch = {
+    // 🔹 Atualiza SOMENTE o sinal do escritório
+    await ref.update({
       officeSignal: {
         state: stateStr,
         comment: commentStr,
@@ -732,27 +736,17 @@ app.post("/office/signal", requireOfficeAuth, async (req, res) => {
       officeComment: commentStr,
       officeSignaledAt: nowTS(),
       updatedAt: nowTS(),
-    };
-
-    if (lock) {
-      patch.officeSignalLock = true;
-      patch.officeSignalLockedAt = nowTS();
-      patch.officeSignalLockedBy = byEmail;
-    }
-
-    patch.audit = FieldValue.arrayUnion({
-      at: nowTS(),
-      by: { userId: byUid, name: byEmail },
-      action: "office_signal",
-      meta: { state: stateStr, lock: !!lock, hasComment: !!commentStr },
+      audit: FieldValue.arrayUnion({
+        at: nowTS(),
+        by: { userId: byUid, name: byEmail },
+        action: "office_signal",
+        meta: { state: stateStr, hasComment: !!commentStr },
+      }),
     });
 
-    await ref.update(patch);
+    const updated = (await ref.get()).data();
 
-    // notifica master + atualiza o card no chat do escritório
-    const updatedSnap = await ref.get();
-    const updated = updatedSnap.data() || {};
-
+    // 🔔 Notifica o Master
     await notifyMasterAboutOfficeSignal({
       taskId: taskIdStr,
       t: updated,
@@ -761,291 +755,57 @@ app.post("/office/signal", requireOfficeAuth, async (req, res) => {
       byEmail,
     });
 
-    // refresca o card do escritório (edit)
+    // 🔄 Atualiza o card no chat do escritório
     await refreshOfficeCard(taskIdStr).catch(() => {});
 
-    // toast amigável para o OfficePanel
-    const toast =
-      stateStr === "comentario"
-        ? "💬 Comentário enviado ao Master (lock)."
-        : stateStr === "tarefa_executada"
-        ? "✅ Marcado como executada e enviado ao Master (lock)."
-        : stateStr === "apresentou_problemas"
-        ? "🚫 Problema reportado ao Master (lock)."
-        : stateStr === "preciso_ajuda"
-        ? "🆘 Pedido de ajuda enviado ao Master."
-        : "🛠️ Em andamento — Master notificado.";
+    // ✅ Toast simples para UI
+    const toastMap = {
+      em_andamento: "🛠️ Em andamento — Master notificado",
+      preciso_ajuda: "🆘 Pedido de ajuda enviado ao Master",
+      apresentou_problemas: "🚫 Problema reportado ao Master",
+      tarefa_executada: "✅ Execução informada ao Master",
+      comentario: "💬 Comentário enviado ao Master",
+    };
 
-    return res.json({ ok: true, toast });
+    return res.json({
+      ok: true,
+      toast: toastMap[stateStr] || "📨 Sinal enviado ao Master",
+    });
   } catch (e) {
     console.error("office/signal error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-// ⛔ Continua na PARTE 3/4:
-// - comandos /start /id /link
-// - handleMessage (create task, awaiting flows)
-// - finalizeWithDetails / saveMasterComment
-// index.js (FULL) — CORRIGIDO (PARTE 3/4)
-// ✅ Commands (/start, /id, /link) + message handler + criação de tarefas
-// - Parte 3/4: comandos do Telegram, auth lock aplicado, criação de task,
-//   fluxos awaiting (feito com detalhes / responder master)
-
- /* =========================
-    Commands (/start, /id, /link)
-    ========================= */
-async function handleCommand(message) {
-  const chatId = message.chat.id;
-  const from = message.from || {};
-  const text = (message.text || "").trim();
-
-  if (text === "/start") {
-    await tgSendMessage(
-      chatId,
-      "✅ <b>VeroTasks Bot online</b>\n\n" +
-        "Para usar, faça login no painel do escritório e vincule seu Telegram.\n\n" +
-        "Comando:\n<code>/link SEU_TOKEN</code>"
-    );
-    return true;
-  }
-
-  if (text === "/id") {
-    const info =
-      `🧾 <b>Chat Info</b>\n` +
-      `• chat_id: <code>${escapeHtml(chatId)}</code>\n` +
-      `• type: <code>${escapeHtml(message.chat.type || "—")}</code>\n` +
-      (message.chat.title ? `• title: <b>${escapeHtml(message.chat.title)}</b>\n` : "") +
-      (from?.id ? `• user_id: <code>${escapeHtml(from.id)}</code>\n` : "");
-    await tgSendMessage(chatId, info);
-    return true;
-  }
-
-  // ✅ vínculo: /link TOKEN (sempre permitido)
-  if (text.toLowerCase().startsWith("/link")) {
-    const parts = text.split(/\s+/).filter(Boolean);
-    const token = String(parts[1] || "").trim().toUpperCase();
-
-    if (!token) {
-      await tgSendMessage(chatId, "ℹ️ Use: <code>/link SEU_TOKEN</code>");
-      return true;
-    }
-
-    const tokenRef = linkTokensCol.doc(token);
-    const tokenSnap = await tokenRef.get();
-
-    if (!tokenSnap.exists) {
-      await tgSendMessage(chatId, "🚫 Token inválido ou já usado. Gere um novo no painel.");
-      return true;
-    }
-
-    const tk = tokenSnap.data() || {};
-    const expiresAt = tk.expiresAt?.toDate ? tk.expiresAt.toDate() : null;
-    const now = new Date();
-
-    if (!expiresAt || now > expiresAt) {
-      await tokenRef.delete().catch(() => {});
-      await tgSendMessage(chatId, "🚫 Token expirado. Gere um novo no painel.");
-      return true;
-    }
-
-    const uid = String(tk.uid || "").trim();
-    if (!uid) {
-      await tokenRef.delete().catch(() => {});
-      await tgSendMessage(chatId, "🚫 Token inválido (sem uid). Gere outro no painel.");
-      return true;
-    }
-
-    // valida usuário
-    const userRef = usersCol.doc(uid);
-    const userSnap = await userRef.get();
-    if (!userSnap.exists) {
-      await tokenRef.delete().catch(() => {});
-      await tgSendMessage(chatId, "🚫 Usuário não existe mais. Gere um novo token no painel.");
-      return true;
-    }
-
-    const userDoc = userSnap.data() || {};
-    if (!isUserAllowed(userDoc)) {
-      await tgSendMessage(chatId, "🚫 Seu acesso está desativado. Fale com o administrador.");
-      return true;
-    }
-
-    // salva vínculo
-    const telegramUserId = String(from.id || "");
-    const telegramChatId = String(chatId || "");
-
-    await userRef.set(
-      {
-        telegramUserId,
-        telegramChatId,
-        telegramLinkedAt: nowTS(),
-        telegramLabel: userLabel(from),
-      },
-      { merge: true }
-    );
-
-    // token 1x
-    await tokenRef.set(
-      {
-        usedAt: nowTS(),
-        usedByTelegramUserId: telegramUserId,
-        usedByTelegramChatId: telegramChatId,
-      },
-      { merge: true }
-    );
-    await tokenRef.delete().catch(() => {});
-
-    await tgSendMessage(
-      chatId,
-      "✅ <b>Telegram vinculado com sucesso!</b>\n" +
-        "Agora você já pode usar o bot neste chat."
-    );
-    return true;
-  }
-
-  return false;
-}
+// ⛔ Continua na PARTE 4/5
+// - callbacks do Master (mstatus / mcomment)
+// - Master fecha tarefa → move para finalizadas
+// index.js (FULL) — CORRIGIDO (PARTE 4/5)
+// ✅ Master callbacks (decisão final) + finalizeWithDetails + saveMasterComment
+// - Master é o ÚNICO que fecha/move para finalizadas (status feito/deu_ruim)
+// - Office apenas sinaliza (parte 3/5)
+// - Aqui: callbacks mstatus/mcomment + fluxo de "feito com detalhes" (awaiting_details)
+// - Atualiza Firestore + refresca card do escritório + notifica solicitante/escritório
 
 /* =========================
-   Incoming message handler
+   Helpers: refresh office card
+   (se ainda não estiver acima no seu arquivo, mantenha 1 só no final)
    ========================= */
-async function handleMessage(message) {
-  const chatId = message.chat.id;
-  const from = message.from || {};
-  const text = message.text || "";
-
-  if (!text) return;
-
-  // comandos sempre passam
-  if (text.startsWith("/")) {
-    const handled = await handleCommand(message);
-    if (handled) return;
-  }
-
-  // 🔒 auth lock
-  const authCheck = await ensureTelegramLinkedOrThrow(message);
-  if (!authCheck.ok) {
-    const reason = authCheck.reason || "not_linked";
-
-    if (reason === "chat_mismatch") {
-      await tgSendMessage(
-        chatId,
-        "🔒 <b>Acesso restrito</b>\n\n" +
-          "Seu Telegram já está vinculado, mas <b>em outro chat</b>.\n" +
-          "Abra o chat correto ou gere um novo token no painel.\n\n" +
-          "<code>/link SEU_TOKEN</code>"
-      );
-      return;
-    }
-
-    if (reason === "not_allowed") {
-      await tgSendMessage(
-        chatId,
-        "🚫 <b>Acesso desativado</b>\n\n" +
-          "Seu usuário está inativo ou sem permissão."
-      );
-      return;
-    }
-
-    await tgSendMessage(
-      chatId,
-      "🔒 <b>Acesso restrito</b>\n\n" +
-        "Faça login no painel e vincule seu Telegram.\n" +
-        "<code>/link SEU_TOKEN</code>"
-    );
-    return;
-  }
-
-  // 1️⃣ Master respondendo comentário?
-  const awaitingMaster = await popAwaitingMaster(from.id);
-  if (awaitingMaster?.taskId) {
-    if (String(chatId) !== String(MASTER_CHAT_ID)) {
-      await tgSendMessage(chatId, "🚫 Apenas o Master pode responder tarefas.");
-      return;
-    }
-
-    await saveMasterComment(awaitingMaster.taskId, from, text);
-    await tgSendMessage(chatId, "✅ Resposta enviada ao escritório.");
-    return;
-  }
-
-  // 2️⃣ Escritório enviando detalhes?
-  const awaiting = await popAwaiting(from.id);
-  if (awaiting?.taskId) {
-    await finalizeWithDetails(awaiting.taskId, from, text);
-    await tgSendMessage(chatId, "✅ Detalhes salvos e tarefa finalizada.");
-    return;
-  }
-
-  // 3️⃣ Criar nova tarefa
-  const priority = inferPriority(text);
-  const createdByName = userLabel(from);
-
-  const officeTargetChatId = OFFICE_CHAT_ID ? Number(OFFICE_CHAT_ID) : chatId;
-
-  const ref = await tasksCol.add({
-    createdAt: nowTS(),
-    createdBy: { chatId, userId: from.id, name: createdByName },
-    source: { chatId, messageId: message.message_id, text },
-
-    office: { chatId: officeTargetChatId, messageId: null },
-
-    priority,
-    status: "aberta",
-    details: "",
-    closedAt: null,
-    closedBy: null,
-
-    officeSignal: null,
-    officeComment: "",
-    officeSignaledAt: null,
-    officeSignalLock: false,
-
-    masterComment: "",
-    masterCommentAt: null,
-
-    audit: [
-      {
-        at: nowTS(),
-        by: { userId: from.id, name: createdByName },
-        action: "create",
-        meta: { priority },
-      },
-    ],
-  });
-
-  const taskId = ref.id;
-
-  await tgSendMessage(chatId, `✅ Tarefa registrada.\nID: <code>${escapeHtml(taskId)}</code>`);
-
+async function refreshOfficeCard(taskId) {
+  const ref = tasksCol.doc(taskId);
   const snap = await ref.get();
+  if (!snap.exists) return;
+
   const t = snap.data();
+  if (!t.office?.chatId || !t.office?.messageId) return;
 
-  // posta no chat do escritório
-  const officeMsg = await tgSendMessage(t.office.chatId, taskCardText(taskId, t), {
-    reply_markup: mainKeyboard(taskId),
-  });
+  const closing = isClosedStatus(t.status);
+  const kb = closing ? { inline_keyboard: [] } : mainKeyboard(taskId);
 
-  await ref.update({
-    "office.messageId": officeMsg.message_id,
-    audit: admin.firestore.FieldValue.arrayUnion({
-      at: nowTS(),
-      by: { userId: "bot", name: "bot" },
-      action: "office_post",
-      meta: { officeMessageId: officeMsg.message_id },
-    }),
+  await tgEditMessage(t.office.chatId, t.office.messageId, taskCardText(taskId, t), {
+    reply_markup: kb,
   });
 }
-
-// ⛔ Continua na PARTE 4/4:
-// - finalizeWithDetails / saveMasterComment
-// - callbacks (office/master)
-// - webhook Telegram
-// - health + setWebhook + boot
-// index.js (FULL) — CORRIGIDO (PARTE 4/4)
-// ✅ finalizeWithDetails + saveMasterComment + callbacks + webhook + health + boot
-// - Parte final: fecha todo o fluxo Telegram ↔ Firestore ↔ OfficePanel
 
 /* =========================
    Save / finalize helpers
@@ -1061,7 +821,13 @@ async function finalizeWithDetails(taskId, from, detailsText) {
     details: String(detailsText || "").slice(0, 4000),
     status: "feito_detalhes",
     closedAt: nowTS(),
-    closedBy: { userId: from.id, name: operatorName },
+    closedBy: { userId: from.id, name: operatorName, via: "office_details" },
+
+    // ao fechar, zera sinal do escritório (opcional, deixa limpo)
+    officeSignal: null,
+    officeComment: "",
+    officeSignaledAt: null,
+
     audit: admin.firestore.FieldValue.arrayUnion({
       at: nowTS(),
       by: { userId: from.id, name: operatorName },
@@ -1091,6 +857,14 @@ async function finalizeWithDetails(taskId, from, detailsText) {
         `📌 Status: ${badgeStatus(updated.status)}`
     );
   }
+
+  // avisa master (opcional)
+  await tgSendMessage(
+    MASTER_CHAT_ID,
+    `📝 <b>Detalhes recebidos</b>\n` +
+      `🧾 Tarefa <code>${escapeHtml(taskId)}</code>\n` +
+      `✅ Feito com detalhes pelo escritório.`
+  ).catch(() => {});
 }
 
 async function saveMasterComment(taskId, from, commentText) {
@@ -1126,13 +900,16 @@ async function saveMasterComment(taskId, from, commentText) {
 }
 
 /* =========================
-   Callback handler (Telegram inline)
+   Master validation
    ========================= */
 function isMasterCallback(cb) {
   const chatId = cb?.message?.chat?.id;
   return String(chatId || "") === String(MASTER_CHAT_ID);
 }
 
+/* =========================
+   Callback handler — FOCO no Master
+   ========================= */
 async function handleCallback(cb) {
   try {
     await tgAnswerCallback(cb.id);
@@ -1150,12 +927,14 @@ async function handleCallback(cb) {
   const snap = await ref.get();
   if (!snap.exists) return;
 
-  const t = snap.data();
+  const t = snap.data() || {};
   const operatorName = userLabel(cb.from);
   const officeChatId = t.office?.chatId;
   const officeMessageId = t.office?.messageId;
 
-  // ===== MASTER =====
+  /* =========================
+     ✅ MASTER: decide status final
+     ========================= */
   if (action === "mstatus") {
     if (!isMasterCallback(cb)) return;
     if (!["pendente", "feito", "deu_ruim"].includes(value)) return;
@@ -1166,10 +945,12 @@ async function handleCallback(cb) {
       status: value,
       closedAt: closing ? nowTS() : null,
       closedBy: { userId: cb.from.id, name: operatorName, via: "master" },
+
+      // quando master decide, limpa sinal do escritório (pra UI não ficar confusa)
       officeSignal: null,
       officeComment: "",
       officeSignaledAt: null,
-      officeSignalLock: false,
+
       audit: admin.firestore.FieldValue.arrayUnion({
         at: nowTS(),
         by: { userId: cb.from.id, name: operatorName },
@@ -1178,9 +959,10 @@ async function handleCallback(cb) {
       }),
     });
 
+    // atualiza card no chat do escritório (remove teclado se fechou)
     await refreshOfficeCard(taskId);
 
-    const updated = (await ref.get()).data();
+    const updated = (await ref.get()).data() || {};
 
     // avisa solicitante
     const createdChatId = updated.createdBy?.chatId;
@@ -1193,7 +975,7 @@ async function handleCallback(cb) {
       );
     }
 
-    // avisa escritório
+    // avisa escritório (curto)
     if (officeChatId) {
       await tgSendMessage(
         officeChatId,
@@ -1202,9 +984,13 @@ async function handleCallback(cb) {
           `📌 Status: ${badgeStatus(value)}`
       );
     }
+
     return;
   }
 
+  /* =========================
+     ✅ MASTER: responder (mensagem livre)
+     ========================= */
   if (action === "mcomment") {
     if (!isMasterCallback(cb)) return;
 
@@ -1219,9 +1005,62 @@ async function handleCallback(cb) {
     return;
   }
 
+  /* =========================
+     OFFICE callbacks (prioridade/close/back/status) ficam na PARTE 5/5
+     - se você quiser, dá pra remover status office e deixar só prioridade+close menu,
+       ou até remover close menu inteiro e deixar só Master fechar.
+     ========================= */
+}
+// index.js (FULL) — CORRIGIDO (PARTE 5/5)
+// ✅ Office callbacks mínimos + Webhook + Health + setWebhook + Boot
+// - Office: só prioridade (prio:*)
+// - Master: mstatus/mcomment já estão na PARTE 4/5
+// - Webhook /health /setWebhook /boot aqui
+
+/* =========================
+   ✅ OFFICE callbacks (mínimos)
+   - Apenas prioridade (prio)
+   - Remove "close/back/status" do escritório (Master-only finaliza)
+   ========================= */
+async function handleCallback(cb) {
+  try {
+    await tgAnswerCallback(cb.id);
+  } catch {}
+
+  const data = cb.data || "";
+  const parts = data.split(":");
+  const action = parts[0];
+  const taskId = parts[1];
+  const value = parts[2];
+
+  if (!taskId) return;
+
+  const ref = tasksCol.doc(taskId);
+  const snap = await ref.get();
+  if (!snap.exists) return;
+
+  const t = snap.data() || {};
+  const operatorName = userLabel(cb.from);
+  const officeChatId = t.office?.chatId;
+  const officeMessageId = t.office?.messageId;
+
+  // ===== MASTER =====
+  // ⚠️ IMPORTANTE:
+  // As ações do master (mstatus / mcomment) estão na PARTE 4/5.
+  // Se você colou este arquivo como um só, NÃO duplique a função handleCallback.
+  // ✅ Se aqui estiver “batendo” com a parte 4, mantenha APENAS UMA versão.
+  //
+  // Para ficar consistente: recomendo manter o handleCallback COMPLETO da PARTE 4/5,
+  // e aqui deixar apenas o bloco OFFICE abaixo (extraindo para uma função handleOfficeCallback).
+  //
+  // Como você está montando em partes, vou manter o OFFICE abaixo
+  // e você deve MESCLAR dentro do handleCallback da PARTE 4/5.
+
   // ===== OFFICE =====
-  if (cb.message?.chat?.id && officeChatId && String(cb.message.chat.id) !== String(officeChatId))
+  // Só aceita callback vindo do chat do escritório
+  if (cb.message?.chat?.id && officeChatId && String(cb.message.chat.id) !== String(officeChatId)) {
     return;
+  }
 
   if (action === "prio") {
     if (!["alta", "media", "baixa"].includes(value)) return;
@@ -1234,125 +1073,54 @@ async function handleCallback(cb) {
         action: "priority",
         meta: { priority: value },
       }),
+      updatedAt: nowTS(),
     });
 
-    const updated = (await ref.get()).data();
+    const updated = (await ref.get()).data() || {};
     if (officeChatId && officeMessageId) {
       await tgEditMessage(
         officeChatId,
         officeMessageId,
         taskCardText(taskId, updated),
-        { reply_markup: mainKeyboard(taskId) }
+        { reply_markup: mainKeyboard(taskId) } // só prioridade + concluir (se você quiser remover "Concluir", veja abaixo)
       );
     }
+
     return;
   }
 
-  if (action === "close") {
-    if (officeChatId && officeMessageId) {
-      await tgEditMessage(
-        officeChatId,
-        officeMessageId,
-        taskCardText(taskId, t),
-        { reply_markup: closeKeyboard(taskId) }
-      );
-    }
-    return;
-  }
-
-  if (action === "back") {
-    const updated = (await ref.get()).data();
-    if (officeChatId && officeMessageId) {
-      await tgEditMessage(
-        officeChatId,
-        officeMessageId,
-        taskCardText(taskId, updated),
-        { reply_markup: mainKeyboard(taskId) }
-      );
-    }
-    return;
-  }
-
-  if (action === "status") {
-    if (!["pendente", "feito", "feito_detalhes", "deu_ruim"].includes(value)) return;
-
-    if (value === "feito_detalhes") {
-      await ref.update({
-        status: "feito_detalhes",
-        closedAt: null,
-        closedBy: { userId: cb.from.id, name: operatorName },
-        audit: admin.firestore.FieldValue.arrayUnion({
-          at: nowTS(),
-          by: { userId: cb.from.id, name: operatorName },
-          action: "status",
-          meta: { status: "feito_detalhes" },
-        }),
-      });
-
-      await setAwaiting(cb.from.id, taskId);
-
-      if (officeChatId) {
-        await tgSendMessage(
-          officeChatId,
-          `📝 <b>Detalhes necessários</b>\n` +
-            `Tarefa <code>${escapeHtml(taskId)}</code>\n` +
-            `Responda com UMA mensagem contendo os detalhes.`
-        );
-      }
-
-      const updated = (await ref.get()).data();
-      if (officeChatId && officeMessageId) {
-        await tgEditMessage(
-          officeChatId,
-          officeMessageId,
-          taskCardText(taskId, updated),
-          { reply_markup: closeKeyboard(taskId) }
-        );
-      }
-      return;
-    }
-
-    const closing = value === "feito" || value === "deu_ruim";
-
-    await ref.update({
-      status: value,
-      closedAt: closing ? nowTS() : null,
-      closedBy: { userId: cb.from.id, name: operatorName },
-      ...(closing
-        ? { officeSignal: null, officeComment: "", officeSignaledAt: null, officeSignalLock: false }
-        : {}),
-      audit: admin.firestore.FieldValue.arrayUnion({
-        at: nowTS(),
-        by: { userId: cb.from.id, name: operatorName },
-        action: "status",
-        meta: { status: value },
-      }),
-    });
-
-    const updated = (await ref.get()).data();
-
-    if (officeChatId && officeMessageId) {
-      await tgEditMessage(
-        officeChatId,
-        officeMessageId,
-        taskCardText(taskId, updated),
-        {
-          reply_markup: closing ? { inline_keyboard: [] } : mainKeyboard(taskId),
-        }
-      );
-    }
-
-    const createdChatId = updated.createdBy?.chatId;
-    if (createdChatId) {
-      await tgSendMessage(
-        createdChatId,
-        `📣 Sua tarefa <code>${escapeHtml(taskId)}</code> foi atualizada:\n` +
-          `📌 Status: ${badgeStatus(updated.status)}\n` +
-          `⚡ Prioridade: ${badgePriority(updated.priority)}`
-      );
-    }
-  }
+  // ✅ Removidos:
+  // - close
+  // - back
+  // - status (feito/pendente/deu_ruim/feito_detalhes)
+  return;
 }
+
+/* =========================================================
+   ✅ OPCIONAL (RECOMENDADO):
+   Remover o botão "✅ Concluir" do teclado do escritório
+   =========================================
+   Se você quer 100% Master-only, altere mainKeyboard
+   para NÃO ter "close" (já que não existe mais).
+   No seu código atual, mainKeyboard tem:
+   - prio buttons
+   - "✅ Concluir" callback_data close:...
+   ✅ Troque por:
+   inline_keyboard apenas com prioridade.
+   ========================================================= */
+/*
+function mainKeyboard(taskId) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "🔴 Alta", callback_data: `prio:${taskId}:alta` },
+        { text: "🟡 Média", callback_data: `prio:${taskId}:media` },
+        { text: "🟢 Baixa", callback_data: `prio:${taskId}:baixa` },
+      ],
+    ],
+  };
+}
+*/
 
 /* =========================
    Telegram Webhook
@@ -1365,13 +1133,17 @@ app.post("/telegram/webhook", async (req, res) => {
 
     const update = req.body || {};
 
+    // ✅ callbacks
     if (update.callback_query) await handleCallback(update.callback_query);
+
+    // ✅ mensagens
     if (update.message) await handleMessage(update.message);
 
-    res.status(200).send("ok");
+    return res.status(200).send("ok");
   } catch (e) {
     console.error("telegram webhook error:", e?.message || e);
-    res.status(200).send("ok");
+    // sempre 200 pro Telegram não ficar repetindo
+    return res.status(200).send("ok");
   }
 });
 
@@ -1390,6 +1162,7 @@ app.get("/health", async (_, res) => {
       authLock: true,
       baseUrl: BASE_URL,
       hasOfficeChat: !!OFFICE_CHAT_ID,
+      mode: "master_only_finalize",
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -1433,4 +1206,5 @@ app.listen(listenPort, () => {
   console.log(`→ OFFICE_CHAT_ID: ${OFFICE_CHAT_ID || "(mesmo chat do solicitante)"}`);
   console.log(`→ MASTER_CHAT_ID: ${MASTER_CHAT_ID}`);
   console.log("→ AUTH_LOCK: ON (requires /link + chat match + role/status)");
+  console.log("→ MODE: Master-only finalize (office only signals + priority)");
 });
