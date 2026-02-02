@@ -1,6 +1,12 @@
-.env
-node_modules
-.DS_Store
+# Firebase / Secrets
+serviceAccount.json
+*.json.secret
 
-# Local Netlify folder
-.netlify
+# Pastas locais
+txt/
+verotasks-office-web/
+
+# Node
+node_modules/
+.env
+.env.local

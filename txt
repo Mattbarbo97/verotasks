@@ -1,0 +1,53 @@
+$BASE="https://verotasks.onrender.com"
+$SECRET="vt_office_2026_02_01_9d7f3a1c1b4d8e2209"
+$TASK="7cn7bmNIBTv7P0lumnn3"
+
+$payload = @{
+  taskId  = $TASK
+  state   = "preciso_ajuda"
+  comment = "teste notify master"
+  by      = @{ uid="office-web"; email="office@teste.com" }
+} | ConvertTo-Json -Depth 10
+
+Invoke-WebRequest -Method POST -Uri "$BASE/office/signal" -UseBasicParsing `
+  -Headers @{ "x-office-secret" = $SECRET } `
+  -ContentType "application/json" `
+  -Body $payload
+
+
+
+
+
+
+
+
+
+
+$BASE="https://verotasks.onrender.com"
+$SECRET="vt_office_2026_02_01_9d7f3a1c1b4d8e2209"
+$TASK="7cn7bmNIBTv7P0lumnn3"
+
+$payload = @{
+  taskId  = $TASK
+  state   = "preciso_ajuda"
+  comment = "teste notify master"
+  by      = @{ uid="office-web"; email="office@teste.com" }
+} | ConvertTo-Json -Depth 10
+
+try {
+  Invoke-WebRequest -Method POST -Uri "$BASE/office/signal" -UseBasicParsing `
+    -Headers @{ "x-office-secret" = $SECRET } `
+    -ContentType "application/json" `
+    -Body $payload
+} catch {
+  $resp = $_.Exception.Response
+  if ($resp -and $resp.GetResponseStream()) {
+    $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+    $body = $reader.ReadToEnd()
+    "HTTP STATUS: $($resp.StatusCode.value__) $($resp.StatusDescription)"
+    "BODY:"
+    $body
+  } else {
+    $_.Exception.Message
+  }
+}
