@@ -1,12 +1,17 @@
-# Firebase / Secrets
-serviceAccount.json
-*.json.secret
-
-# Pastas locais
-txt/
-verotasks-office-web/
-
-# Node
-node_modules/
+# env
 .env
-.env.local
+.env.*
+backend/.env
+backend/.env.*
+
+# firebase / secrets
+serviceAccount.json
+backend/serviceAccount.json
+**/serviceAccount.json
+
+# node
+node_modules
+backend/node_modules
+
+# misc
+.DS_Store

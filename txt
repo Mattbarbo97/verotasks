@@ -1,0 +1,15 @@
+$BASE="https://verotasks.onrender.com"
+$SECRET="vt_office_2026_02_01_9d7f3a1c1b4d8e2209"
+
+$body = @{
+  action = "help"          # help | doing | executed | comment
+  taskId  = "debug-123"
+  message = "Teste ação rápida do Office"
+  office  = "office-web"
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Method POST `
+  -Uri "$BASE/office/signal" `
+  -Headers @{ "Content-Type"="application/json"; "x-office-secret"=$SECRET } `
+  -Body $body
