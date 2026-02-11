@@ -1,4 +1,4 @@
-// src/routes/office.js
+// backend/src/routes/office.js
 const express = require("express");
 const { requireOfficeAuth } = require("../middlewares/requireSecrets");
 const { collections } = require("../firebase/collections");
@@ -7,8 +7,8 @@ const { nowTS } = require("../services/awaiting");
 const { createUniqueLinkTokenDoc } = require("../services/linkTokens");
 const { isUserAllowed } = require("../services/telegramAuth");
 
-const tgClient = require("../telegram/client"); // ✅ axios client
-const { safeStr, escapeHtml } = require("../telegram/helpers");
+const tgClient = require("../telegram/client"); // axios client (já existente no seu projeto)
+const { safeStr } = require("../telegram/helpers");
 const { isClosedStatus } = require("../telegram/text");
 const { notifyMasterAboutOfficeSignal, refreshOfficeCard } = require("../services/tasks");
 
@@ -86,7 +86,7 @@ router.post("/link-token", requireOfficeAuth(process.env), async (req, res) => {
       expiresAt: expiresAt?.toDate ? expiresAt.toDate().toISOString() : null,
     });
   } catch (e) {
-    console.error("office/link-token error:", e?.message || e);
+    console.error("office/link-token error:", e);
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
@@ -95,8 +95,14 @@ router.post("/link-token", requireOfficeAuth(process.env), async (req, res) => {
  * ✅ Signal task (Office -> Master)
  * POST /office/signal
  * body: { taskId, state, comment?, by? {uid,email} }
+ *
+ * REGRA DE OURO:
+ * - Salvou no Firestore? então retorna 200 SEMPRE.
+ * - Falha no Telegram vira notified:false (não 500).
  */
 router.post("/signal", requireOfficeAuth(process.env), async (req, res) => {
+  const reqId = `sig_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+
   try {
     const { taskId, state, comment = "", by = null } = req.body || {};
     const taskIdStr = String(taskId || "").trim();
@@ -130,6 +136,7 @@ router.post("/signal", requireOfficeAuth(process.env), async (req, res) => {
       return res.status(409).json({ ok: false, error: "task_closed" });
     }
 
+    // ✅ 1) salva SEMPRE
     await ref.update({
       officeSignal: {
         state: stateStr,
@@ -144,24 +151,13 @@ router.post("/signal", requireOfficeAuth(process.env), async (req, res) => {
         at: nowTS(),
         by: { userId: byUid, name: byEmail },
         action: "office_signal",
-        meta: { state: stateStr, hasComment: !!commentStr },
+        meta: { state: stateStr, hasComment: !!commentStr, reqId },
       }),
     });
 
     const updated = (await ref.get()).data() || {};
 
-    // notifica Master (via Telegram)
-    await notifyMasterAboutOfficeSignal(tgApi, process.env, {
-      taskId: taskIdStr,
-      t: updated,
-      state: stateStr,
-      comment: commentStr,
-      byEmail,
-    });
-
-    // atualiza card do escritório (não quebra se falhar)
-    await refreshOfficeCard(tgApi, taskIdStr).catch(() => {});
-
+    // toast base
     const toast =
       stateStr === "comentario"
         ? "💬 Comentário enviado ao Master."
@@ -173,18 +169,64 @@ router.post("/signal", requireOfficeAuth(process.env), async (req, res) => {
         ? "🆘 Pedido de ajuda enviado ao Master."
         : "🛠️ Em andamento — Master notificado.";
 
-    return res.json({ ok: true, toast });
-  } catch (e) {
-    console.error("office/signal error:", e?.message || e);
+    // ✅ 2) tenta notificar (mas NÃO pode quebrar o HTTP)
+    let notified = true;
+    let notifyError = null;
 
-    // ajuda debug sem vazar segredo
-    const msg = String(e?.message || e || "");
+    try {
+      await notifyMasterAboutOfficeSignal(tgApi, process.env, {
+        taskId: taskIdStr,
+        t: updated,
+        state: stateStr,
+        comment: commentStr,
+        byEmail,
+        reqId,
+      });
+    } catch (err) {
+      notified = false;
+      notifyError = String(err?.message || err || "").slice(0, 220);
+      console.error(`[office/signal][${reqId}] notifyMaster failed:`, err);
+
+      // marca no doc que falhou avisar (pra auditoria / re-tentativa futura)
+      try {
+        await ref.update({
+          officeSignalNotify: {
+            ok: false,
+            error: notifyError,
+            at: nowTS(),
+            reqId,
+          },
+          updatedAt: nowTS(),
+        });
+      } catch (_) {}
+    }
+
+    // ✅ 3) refresh do card (best effort)
+    try {
+      await refreshOfficeCard(tgApi, taskIdStr);
+    } catch (_) {}
+
+    // ✅ 4) resposta SEMPRE 200 quando salvou
+    if (!notified) {
+      return res.json({
+        ok: true,
+        saved: true,
+        notified: false,
+        toast: "⚠️ Sinal salvo, mas não consegui avisar o Master (Telegram).",
+        reqId,
+      });
+    }
+
+    return res.json({ ok: true, saved: true, notified: true, toast, reqId });
+  } catch (e) {
+    console.error(`[office/signal][${reqId}] error:`, e);
     return res.status(500).json({
       ok: false,
       error: "server_error",
-      detail: msg.slice(0, 180),
+      reqId,
+      detail: String(e?.message || e || "").slice(0, 180),
     });
   }
 });
 
-module.exports = router; // ✅ exporta Router middleware direto
+module.exports = router;
