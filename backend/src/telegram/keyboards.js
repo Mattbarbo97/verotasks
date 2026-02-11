@@ -22,6 +22,7 @@ function masterKeyboard(taskId) {
       [{ text: "🚫 Deu ruim", callback_data: `mstatus:${taskId}:deu_ruim` }],
       [{ text: "📝 Pedir detalhes", callback_data: `mdetails:${taskId}` }],
       [{ text: "💬 Responder", callback_data: `mcomment:${taskId}` }],
+      [{ text: "📍 Atribuir", callback_data: `massign_help:${taskId}` }],
     ],
   };
 }

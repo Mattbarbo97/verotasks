@@ -18,6 +18,9 @@ const {
   masterSetStatus,
   officeSetPriority,
   masterAskComment,
+
+  // ✅ NOVO
+  masterAssignTask,
 } = require("../services/tasks");
 
 function FieldValue() {
@@ -31,6 +34,11 @@ function verifyWebhookSecret(cfg, req) {
 
 function isMasterCallback(cfg, cb) {
   const chatId = cb?.message?.chat?.id;
+  return String(chatId || "") === String(cfg.MASTER_CHAT_ID);
+}
+
+function isMasterMessage(cfg, message) {
+  const chatId = message?.chat?.id;
   return String(chatId || "") === String(cfg.MASTER_CHAT_ID);
 }
 
@@ -82,6 +90,30 @@ async function handleCommand(tgApi, cfg, message) {
       (message.chat.title ? `• title: <b>${escapeHtml(message.chat.title)}</b>\n` : "") +
       (from?.id ? `• user_id: <code>${escapeHtml(from.id)}</code>\n` : "");
     await tgApi.sendMessage(chatId, info);
+    return true;
+  }
+
+  // ✅ NOVO: comando do Master para atribuir
+  // /assign TASK_ID UID
+  if (text.toLowerCase().startsWith("/assign")) {
+    if (!isMasterMessage(cfg, message)) {
+      await tgApi.sendMessage(chatId, "🚫 Apenas o Master pode usar /assign.");
+      return true;
+    }
+
+    const parts = text.split(/\s+/).filter(Boolean);
+    const taskId = String(parts[1] || "").trim();
+    const uid = String(parts[2] || "").trim();
+
+    if (!taskId || !uid) {
+      await tgApi.sendMessage(
+        chatId,
+        "ℹ️ Use:\n<code>/assign TASK_ID UID</code>\n\nEx:\n<code>/assign AbC123xYz uQ9....</code>"
+      );
+      return true;
+    }
+
+    await masterAssignTask(tgApi, cfg, { taskId, cbFrom: from, assigneeUid: uid });
     return true;
   }
 
@@ -164,7 +196,7 @@ async function handleMessage(tgApi, cfg, message) {
   const text = message.text || "";
   if (!text) return;
 
-  // comandos passam sempre (inclui /link)
+  // comandos passam sempre (inclui /link e /assign)
   if (text.startsWith("/")) {
     const handled = await handleCommand(tgApi, cfg, message);
     if (handled) return;
@@ -235,6 +267,10 @@ async function handleMessage(tgApi, cfg, message) {
     details: "",
     closedAt: null,
     closedBy: null,
+
+    assignedTo: null,
+    assignedAt: null,
+    assignedBy: null,
 
     officeSignal: null,
     officeComment: "",
@@ -316,6 +352,20 @@ async function handleCallback(tgApi, cfg, cb) {
         `Solicitado pelo escritório.\n\n` +
         `Use os botões abaixo para decidir:`,
       { reply_markup: masterKeyboard(taskId) }
+    );
+    return;
+  }
+
+  // ✅ NOVO: botão "Atribuir" (ajuda)
+  if (action === "massign_help") {
+    if (!isMasterCallback(cfg, cb)) return;
+    await tgApi.sendMessage(
+      cfg.MASTER_CHAT_ID,
+      `📍 <b>Atribuir tarefa</b>\n` +
+        `🧾 Tarefa: <code>${escapeHtml(taskId)}</code>\n\n` +
+        `Use o comando:\n` +
+        `<code>/assign ${escapeHtml(taskId)} UID_DO_USUARIO</code>\n\n` +
+        `O UID você pega no painel (usuários).`
     );
     return;
   }

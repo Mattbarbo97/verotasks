@@ -48,6 +48,24 @@ function taskCardText(taskId, t) {
   const createdAtStr = createdAt.toLocaleString("pt-BR");
   const msg = t.source?.text || "—";
 
+  // ✅ NOVO: bloco de atribuição
+  let assignedBlock = "";
+  if (t.assignedTo && typeof t.assignedTo === "object") {
+    const name = safeStr(t.assignedTo.name || "");
+    const email = safeStr(t.assignedTo.email || "");
+    const uid = safeStr(t.assignedTo.uid || "");
+
+    const when = t.assignedAt?.toDate ? t.assignedAt.toDate().toLocaleString("pt-BR") : "";
+    const who = name || email || uid || "—";
+
+    assignedBlock =
+      `\n\n<b>Atribuição:</b>\n` +
+      `👤 <b>Para:</b> ${escapeHtml(who)}` +
+      (email && email !== who ? `\n✉️ <b>Email:</b> ${escapeHtml(email)}` : "") +
+      (uid && uid !== who ? `\n🆔 <b>UID:</b> <code>${escapeHtml(uid)}</code>` : "") +
+      (when ? `\n🕒 <b>Em:</b> ${escapeHtml(when)}` : "");
+  }
+
   let detailsBlock = "";
   if (t.status === "feito_detalhes" && t.details) {
     detailsBlock = `\n\n<b>Detalhes:</b>\n${escapeHtml(t.details)}`;
@@ -73,8 +91,7 @@ function taskCardText(taskId, t) {
     const when = t.masterCommentAt?.toDate
       ? t.masterCommentAt.toDate().toLocaleString("pt-BR")
       : "—";
-    masterBlock =
-      `\n\n<b>Master:</b>\n${escapeHtml(t.masterComment)}\n<b>Em:</b> ${escapeHtml(when)}`;
+    masterBlock = `\n\n<b>Master:</b>\n${escapeHtml(t.masterComment)}\n<b>Em:</b> ${escapeHtml(when)}`;
   }
 
   return (
@@ -84,6 +101,7 @@ function taskCardText(taskId, t) {
     `⚡ <b>Prioridade:</b> ${badgePriority(t.priority)}\n` +
     `📌 <b>Status:</b> ${badgeStatus(t.status)}\n\n` +
     `<b>Mensagem:</b>\n${escapeHtml(msg)}` +
+    assignedBlock +
     detailsBlock +
     officeBlock +
     masterBlock
