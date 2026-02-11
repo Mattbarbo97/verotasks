@@ -3,7 +3,9 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 
-require("./src/firebase/admin");
+// ✅ garante init do Firebase Admin ANTES de routes/collections
+const { initFirebaseAdmin } = require("./src/firebase/admin");
+initFirebaseAdmin();
 
 // Telegram (handler + client axios)
 const { handleUpdate } = require("./src/telegram/webhookHandler");
@@ -14,7 +16,6 @@ function pickRouter(mod) {
   if (!mod) return null;
   if (typeof mod === "function") return mod;
 
-  // formatos comuns
   return (
     mod.router ||
     mod.officeRouter ||
