@@ -25,7 +25,7 @@ function parseServiceAccountFromEnv(env) {
     return obj;
   }
 
-  // Base64 (caso tenha salvo assim)
+  // Base64
   try {
     const decoded = Buffer.from(s, "base64").toString("utf8").trim();
     if (decoded.startsWith("{") && decoded.endsWith("}")) {
@@ -47,27 +47,57 @@ function buildCfgFromEnv(env) {
 }
 
 // ============================
-// Router loader (aceita export em vários formatos)
+// Router loader
 // ============================
 function pickExport(mod) {
   if (!mod) return null;
-
-  // se exportou router direto:
-  if (typeof mod === "function") return mod;
-
-  // se exportou { router } / { officeRouter } etc:
-  return mod.router || mod.officeRouter || mod.adminRouter || mod.default || null;
+  // se exportou objeto
+  return mod.router || mod.officeRouter || mod.adminRouter || mod.default || mod;
 }
 
 // ============================
-// Boot (Firebase + Telegram client)
+// Validação profunda: detecta handlers undefined
+// ============================
+function assertRouterValid(router, name) {
+  if (!router) throw new Error(`${name}: router é null/undefined`);
+
+  // Router do Express é uma função middleware + tem stack
+  const stack = router.stack;
+  if (!Array.isArray(stack)) {
+    // ainda pode ser middleware puro
+    if (typeof router !== "function") {
+      throw new Error(`${name}: não é function e não tem stack`);
+    }
+    return;
+  }
+
+  for (const layer of stack) {
+    // layer.route -> endpoints (get/post/etc)
+    if (layer && layer.route && Array.isArray(layer.route.stack)) {
+      for (const r of layer.route.stack) {
+        if (!r || typeof r.handle !== "function") {
+          const methods = Object.keys(layer.route.methods || {}).join(",") || "unknown";
+          const path = layer.route.path || "(unknown)";
+          throw new Error(`${name}: handler inválido em route ${methods.toUpperCase()} ${path}`);
+        }
+      }
+      continue;
+    }
+
+    // router.use(...) (middlewares)
+    if (!layer || typeof layer.handle !== "function") {
+      throw new Error(`${name}: middleware inválido (router.use com handler undefined?)`);
+    }
+  }
+}
+
+// ============================
+// Boot
 // ============================
 const cfg = buildCfgFromEnv(process.env);
 
-// ✅ inicializa Firebase Admin ANTES de qualquer rota/collection
+// ✅ Firebase Admin init
 const fbAdminMod = require("./src/firebase/admin");
-
-// tenta suportar vários nomes de export pra evitar quebra
 const initFn =
   fbAdminMod.initFirebaseAdmin ||
   fbAdminMod.initFirebase ||
@@ -80,33 +110,43 @@ if (typeof initFn !== "function") {
   );
 }
 
-// chama com cfg (se sua função não aceita param, JS ignora)
 initFn(cfg);
 
-// Telegram
+// ✅ Telegram
 const { createTelegramClient } = require("./src/telegram/client");
 const { handleUpdate } = require("./src/telegram/webhookHandler");
 const tgClient = createTelegramClient(cfg);
 
-// Routes
-const officeMod = require("./src/routes/office");
-const adminMod = require("./src/routes/admin");
+// deps que rotas podem precisar
+const deps = { tgClient };
 
-const officeFactoryOrRouter = pickExport(officeMod);
-const adminFactoryOrRouter = pickExport(adminMod);
+// ============================
+// Routes (factory(cfg, deps) OU router pronto)
+// ============================
+function buildRouter(modPath, name) {
+  const mod = require(modPath);
+  const exp = pickExport(mod);
 
-const officeRouter =
-  typeof officeFactoryOrRouter === "function"
-    ? officeFactoryOrRouter(cfg)
-    : officeFactoryOrRouter;
+  // 1) Se exportou função "factory", chama com (cfg, deps)
+  if (typeof exp === "function" && exp.stack === undefined) {
+    // factory normal (não é router express)
+    const out =
+      exp.length >= 2 ? exp(cfg, deps) : exp(cfg); // se aceitar deps, passa
+    assertRouterValid(out, name);
+    return out;
+  }
 
-const adminRouter =
-  typeof adminFactoryOrRouter === "function"
-    ? adminFactoryOrRouter(cfg)
-    : adminFactoryOrRouter;
+  // 2) Se exportou router (tem stack)
+  if (exp && (typeof exp === "function" || typeof exp === "object")) {
+    assertRouterValid(exp, name);
+    return exp;
+  }
 
-if (!officeRouter) throw new Error("officeRouter inválido: export não é router/factory");
-if (!adminRouter) throw new Error("adminRouter inválido: export não é router/factory");
+  throw new Error(`${name}: export inválido`);
+}
+
+const officeRouter = buildRouter("./src/routes/office", "officeRouter");
+const adminRouter = buildRouter("./src/routes/admin", "adminRouter");
 
 // ============================
 // Express app
@@ -135,10 +175,8 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// Office API
+// Office/Admin
 app.use("/office", officeRouter);
-
-// Admin API
 app.use("/admin", adminRouter);
 
 // Telegram webhook
@@ -155,9 +193,7 @@ app.listen(PORT, () => {
   console.log("✅ VeroTasks Backend online");
   console.log("→ Port:", PORT);
   console.log("→ BASE_URL:", cfg.BASE_URL || "(missing)");
-  console.log("→ OFFICE_CHAT_ID:", cfg.OFFICE_CHAT_ID ? "(set)" : "(mesmo chat do solicitante)");
   console.log("→ MASTER_CHAT_ID:", cfg.MASTER_CHAT_ID || "(missing)");
-  console.log("→ MODE:", cfg.MODE || "master_only_finalize");
   console.log("→ AUTH_LOCK:", cfg.AUTH_LOCK === "ON" ? "ON" : "OFF");
   console.log("→ FIREBASE_ADMIN:", cfg._SERVICE_ACCOUNT_JSON ? "OK" : "MISSING");
 });
