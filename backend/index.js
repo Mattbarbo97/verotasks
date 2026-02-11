@@ -3,14 +3,9 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 
-const { initFirebase } = require("./src/firebase/admin");
-const { createTelegramClient } = require("./src/telegram/client");
-const { handleUpdate } = require("./src/telegram/webhookHandler");
-
 // ============================
 // CFG (normaliza env + service account)
 // ============================
-
 function parseServiceAccountFromEnv(env) {
   const raw =
     env.FIREBASE_SERVICE_ACCOUNT ||
@@ -24,15 +19,13 @@ function parseServiceAccountFromEnv(env) {
   // JSON direto
   if (s.startsWith("{") && s.endsWith("}")) {
     const obj = JSON.parse(s);
-
-    // Render/Netlify às vezes quebra \n do private_key
     if (obj.private_key && typeof obj.private_key === "string") {
       obj.private_key = obj.private_key.replace(/\\n/g, "\n");
     }
     return obj;
   }
 
-  // Base64 (caso você tenha salvo assim)
+  // Base64 (caso tenha salvo assim)
   try {
     const decoded = Buffer.from(s, "base64").toString("utf8").trim();
     if (decoded.startsWith("{") && decoded.endsWith("}")) {
@@ -49,49 +42,75 @@ function parseServiceAccountFromEnv(env) {
 
 function buildCfgFromEnv(env) {
   const cfg = { ...env };
-
-  // compat com seu admin.js (cfg._SERVICE_ACCOUNT_JSON)
-  const sa = parseServiceAccountFromEnv(env);
-  cfg._SERVICE_ACCOUNT_JSON = sa;
-
+  cfg._SERVICE_ACCOUNT_JSON = parseServiceAccountFromEnv(env);
   return cfg;
 }
 
 // ============================
 // Router loader (aceita export em vários formatos)
 // ============================
-
 function pickExport(mod) {
   if (!mod) return null;
+
+  // se exportou router direto:
   if (typeof mod === "function") return mod;
-  return mod.router || mod.officeRouter || mod.adminRouter || mod.telegramRouter || mod.default || null;
+
+  // se exportou { router } / { officeRouter } etc:
+  return mod.router || mod.officeRouter || mod.adminRouter || mod.default || null;
 }
 
 // ============================
-// Boot
+// Boot (Firebase + Telegram client)
 // ============================
-
 const cfg = buildCfgFromEnv(process.env);
 
-// ✅ Firebase admin precisa estar inicializado ANTES de qualquer collections()
-initFirebase(cfg);
+// ✅ inicializa Firebase Admin ANTES de qualquer rota/collection
+const fbAdminMod = require("./src/firebase/admin");
 
-// Routes (normalmente factory(cfg))
+// tenta suportar vários nomes de export pra evitar quebra
+const initFn =
+  fbAdminMod.initFirebaseAdmin ||
+  fbAdminMod.initFirebase ||
+  fbAdminMod.init ||
+  fbAdminMod.default;
+
+if (typeof initFn !== "function") {
+  throw new Error(
+    "Firebase init inválido: ./src/firebase/admin não exporta initFirebaseAdmin/initFirebase/init/default"
+  );
+}
+
+// chama com cfg (se sua função não aceita param, JS ignora)
+initFn(cfg);
+
+// Telegram
+const { createTelegramClient } = require("./src/telegram/client");
+const { handleUpdate } = require("./src/telegram/webhookHandler");
+const tgClient = createTelegramClient(cfg);
+
+// Routes
 const officeMod = require("./src/routes/office");
 const adminMod = require("./src/routes/admin");
 
 const officeFactoryOrRouter = pickExport(officeMod);
 const adminFactoryOrRouter = pickExport(adminMod);
 
-// se exportou factory(cfg), chama. se exportou router direto, usa.
-const officeRouter = typeof officeFactoryOrRouter === "function" ? officeFactoryOrRouter(cfg) : officeFactoryOrRouter;
-const adminRouter = typeof adminFactoryOrRouter === "function" ? adminFactoryOrRouter(cfg) : adminFactoryOrRouter;
+const officeRouter =
+  typeof officeFactoryOrRouter === "function"
+    ? officeFactoryOrRouter(cfg)
+    : officeFactoryOrRouter;
+
+const adminRouter =
+  typeof adminFactoryOrRouter === "function"
+    ? adminFactoryOrRouter(cfg)
+    : adminFactoryOrRouter;
 
 if (!officeRouter) throw new Error("officeRouter inválido: export não é router/factory");
 if (!adminRouter) throw new Error("adminRouter inválido: export não é router/factory");
 
-const tgClient = createTelegramClient(cfg);
-
+// ============================
+// Express app
+// ============================
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
@@ -102,11 +121,11 @@ const CORS_ORIGINS = (cfg.CORS_ORIGINS || "")
 
 app.use(
   cors({
-    origin: (origin, cb) => {
+    origin: function (origin, cb) {
       if (!origin) return cb(null, true);
       if (CORS_ORIGINS.length === 0) return cb(null, true);
       if (CORS_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS blocked"), false);
+      return cb(new Error("CORS blocked: " + origin));
     },
     credentials: true,
   })
@@ -122,7 +141,7 @@ app.use("/office", officeRouter);
 // Admin API
 app.use("/admin", adminRouter);
 
-// Telegram webhook (mantém seu padrão atual)
+// Telegram webhook
 app.post("/telegram/webhook", (req, res) => {
   return handleUpdate(tgClient, cfg, req, res);
 });
