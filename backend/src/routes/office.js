@@ -3,11 +3,12 @@ const express = require("express");
 const { requireOfficeAuth } = require("../middlewares/requireSecrets");
 const { collections } = require("../firebase/collections");
 const { getAdmin } = require("../firebase/admin");
+const { see } = require("../services/awaiting"); // (não usado, pode remover se quiser)
 const { nowTS } = require("../services/awaiting");
 const { createUniqueLinkTokenDoc } = require("../services/linkTokens");
 const { isUserAllowed } = require("../services/telegramAuth");
 
-const tgClient = require("../telegram/client"); // axios client (já existente no seu projeto)
+const tgClient = require("../telegram/client"); // axios client
 const { safeStr } = require("../telegram/helpers");
 const { isClosedStatus } = require("../telegram/text");
 const { notifyMasterAboutOfficeSignal, refreshOfficeCard } = require("../services/tasks");
@@ -34,6 +35,16 @@ function createTgApi() {
       if (!data?.ok) throw new Error(`editMessageText failed: ${JSON.stringify(data)}`);
       return data.result;
     },
+  };
+}
+
+function buildCfgFromEnv(env) {
+  // ✅ fonte de verdade mínima e explícita (evita undefined silencioso)
+  return {
+    MASTER_CHAT_ID: String(env.MASTER_CHAT_ID || "").trim(),
+    OFFICE_CHAT_ID: String(env.OFFICE_CHAT_ID || "").trim(),
+    MODE: String(env.MODE || "master_only_finalize").trim(),
+    AUTH_LOCK: String(env.AUTH_LOCK || "OFF").trim(),
   };
 }
 
@@ -95,10 +106,6 @@ router.post("/link-token", requireOfficeAuth(process.env), async (req, res) => {
  * ✅ Signal task (Office -> Master)
  * POST /office/signal
  * body: { taskId, state, comment?, by? {uid,email} }
- *
- * REGRA DE OURO:
- * - Salvou no Firestore? então retorna 200 SEMPRE.
- * - Falha no Telegram vira notified:false (não 500).
  */
 router.post("/signal", requireOfficeAuth(process.env), async (req, res) => {
   const reqId = `sig_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
@@ -157,7 +164,6 @@ router.post("/signal", requireOfficeAuth(process.env), async (req, res) => {
 
     const updated = (await ref.get()).data() || {};
 
-    // toast base
     const toast =
       stateStr === "comentario"
         ? "💬 Comentário enviado ao Master."
@@ -170,11 +176,17 @@ router.post("/signal", requireOfficeAuth(process.env), async (req, res) => {
         : "🛠️ Em andamento — Master notificado.";
 
     // ✅ 2) tenta notificar (mas NÃO pode quebrar o HTTP)
+    const cfg = buildCfgFromEnv(process.env);
+
+    if (!cfg.MASTER_CHAT_ID) {
+      console.error(`[office/signal][${reqId}] MASTER_CHAT_ID missing`);
+    }
+
     let notified = true;
     let notifyError = null;
 
     try {
-      await notifyMasterAboutOfficeSignal(tgApi, process.env, {
+      await notifyMasterAboutOfficeSignal(tgApi, cfg, {
         taskId: taskIdStr,
         t: updated,
         state: stateStr,
@@ -187,7 +199,6 @@ router.post("/signal", requireOfficeAuth(process.env), async (req, res) => {
       notifyError = String(err?.message || err || "").slice(0, 220);
       console.error(`[office/signal][${reqId}] notifyMaster failed:`, err);
 
-      // marca no doc que falhou avisar (pra auditoria / re-tentativa futura)
       try {
         await ref.update({
           officeSignalNotify: {
