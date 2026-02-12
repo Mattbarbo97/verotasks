@@ -2,6 +2,9 @@
 const { collections } = require("../firebase/collections");
 const { nowTS } = require("../services/awaiting");
 
+// =========================================================
+// Utils
+// =========================================================
 function safeText(v) {
   return String(v || "").trim();
 }
@@ -32,15 +35,49 @@ function normalizePriority(p) {
   return "media";
 }
 
-function parsePriorityCommand(text) {
-  const t = safeText(text);
-  const m = t.match(/^\/(?:p|prioridade)\s+(baixa|media|m[eé]dia|alta|urgente|critica|cr[ií]tica)\s*$/i);
-  if (!m) return null;
-  return normalizePriority(m[1]);
+function priorityBadge(p) {
+  const pr = normalizePriority(p);
+  if (pr === "urgente") return "🚨 URGENTE";
+  if (pr === "alta") return "🔥 ALTA";
+  if (pr === "baixa") return "🟢 BAIXA";
+  return "🟡 MÉDIA";
+}
+
+function parsePriorityFromCommand(rawText) {
+  // aceita:
+  // /p alta
+  // /prioridade urgente
+  // /p urgente\nmensagem
+  // /p alta mensagem...
+  const t = safeText(rawText);
+  if (!t) return { priority: "media", cleanText: "" };
+
+  // multiline: primeira linha /p X
+  const lines = t.split("\n");
+  const first = safeText(lines[0]);
+
+  const m1 = first.match(/^\/(?:p|prioridade)\s+(baixa|media|m[eé]dia|alta|urgente|critica|cr[ií]tica)\s*$/i);
+  if (m1) {
+    const pr = normalizePriority(m1[1]);
+    const cleanText = safeText(lines.slice(1).join("\n"));
+    return { priority: pr, cleanText };
+  }
+
+  // inline: /p alta mensagem...
+  const m2 = t.match(/^\/(?:p|prioridade)\s+(baixa|media|m[eé]dia|alta|urgente|critica|cr[ií]tica)\s+([\s\S]+)$/i);
+  if (m2) {
+    const pr = normalizePriority(m2[1]);
+    const cleanText = safeText(m2[2]);
+    return { priority: pr, cleanText };
+  }
+
+  return { priority: null, cleanText: t };
 }
 
 function detectPriorityFromText(text) {
   const t = safeText(text).toLowerCase();
+  if (!t) return "media";
+
   if (/(urgente|cr[ií]tico|critico|cr[ií]tica|emerg[eê]ncia|emergencia|parou|travou|fora do ar)/.test(t)) {
     return "urgente";
   }
@@ -53,26 +90,13 @@ function detectPriorityFromText(text) {
   return "media";
 }
 
-function pickPriority(text) {
-  return parsePriorityCommand(text) || detectPriorityFromText(text);
-}
-
 function buildTitle(text) {
   const t = safeText(text);
   if (!t) return "Solicitação via Telegram";
-  const cleaned = t.replace(/^\/(?:p|prioridade)\s+\S+\s*/i, "").trim();
-  return (cleaned || t).slice(0, 80);
+  return t.replace(/\s+/g, " ").slice(0, 80);
 }
 
-function priorityBadge(p) {
-  const pr = normalizePriority(p);
-  if (pr === "urgente") return "🚨 URGENTE";
-  if (pr === "alta") return "🔥 ALTA";
-  if (pr === "baixa") return "🟢 BAIXA";
-  return "🟡 MÉDIA";
-}
-
-// rate limit simples (anti-flood)
+// rate-limit simples
 const RL = new Map();
 function hitRateLimit(key, minIntervalMs) {
   const now = Date.now();
@@ -82,6 +106,9 @@ function hitRateLimit(key, minIntervalMs) {
   return false;
 }
 
+// =========================================================
+// Handler
+// =========================================================
 async function handleUpdate(tg, cfg, req, res) {
   try {
     const update = req.body || {};
@@ -90,11 +117,11 @@ async function handleUpdate(tg, cfg, req, res) {
 
     const chatId = msg?.chat?.id;
     const fromId = msg?.from?.id;
-    const text = safeText(msg?.text);
+    const rawText = safeText(msg?.text);
 
     if (!chatId) return res.json({ ok: true });
 
-    // webhook secret (se usar)
+    // Secret do webhook (se usar)
     if (cfg.TELEGRAM_WEBHOOK_SECRET) {
       const secretHeader =
         req.headers["x-telegram-bot-api-secret-token"] ||
@@ -110,32 +137,32 @@ async function handleUpdate(tg, cfg, req, res) {
 
     const { usersCol, tasksCol, linkTokensCol } = collections();
 
-    // /start /help
-    if (text === "/start" || text === "/help") {
+    // help
+    if (rawText === "/start" || rawText === "/help") {
       await sendText(
         tg,
         chatId,
-        "✅ VeroBot\n\nEnvie a solicitação normalmente.\n\nPrioridade:\n/p baixa | /p media | /p alta | /p urgente\n\nEx:\n/p urgente\nSistema travou!"
+        "✅ VeroBot\n\nEnvie sua solicitação.\n\nPrioridade:\n/p baixa\n/p media\n/p alta\n/p urgente\n\nEx:\n/p urgente\nSistema travou!"
       );
       return res.json({ ok: true });
     }
 
-    // anti-flood
+    // anti flood
     if (fromId && hitRateLimit(`u:${fromId}`, 2500)) {
       await sendText(tg, chatId, "⏳ Aguarde 2s e tente novamente.");
       return res.json({ ok: true });
     }
 
-    // LOCK ON (mantém restrito)
+    // LOCK ON (mantém /link se precisar)
     if (lockOn) {
       const linkedSnap = await usersCol.where("telegramChatId", "==", chatId).limit(1).get();
       const isLinked = !linkedSnap.empty;
 
-      const linkMatch = text.match(/^\/link(?:@[\w_]+)?\s+(\S+)\s*$/i);
+      const linkMatch = rawText.match(/^\/link(?:@[\w_]+)?\s+(\S+)\s*$/i);
       if (!isLinked && linkMatch && linkMatch[1]) {
         const tokenId = String(linkMatch[1]).trim();
         if (!linkTokensCol) {
-          await sendText(tg, chatId, "❌ Vinculação indisponível agora.");
+          await sendText(tg, chatId, "❌ Vinculação indisponível.");
           return res.json({ ok: true });
         }
         const tokenRef = linkTokensCol.doc(tokenId);
@@ -166,11 +193,7 @@ async function handleUpdate(tg, cfg, req, res) {
         );
 
         await tokenRef.set(
-          {
-            consumedAt: nowTS(),
-            consumedByChatId: chatId,
-            consumedByUserId: fromId || null,
-          },
+          { consumedAt: nowTS(), consumedByChatId: chatId, consumedByUserId: fromId || null },
           { merge: true }
         );
 
@@ -179,11 +202,7 @@ async function handleUpdate(tg, cfg, req, res) {
       }
 
       if (!isLinked) {
-        await sendText(
-          tg,
-          chatId,
-          "🔒 Acesso restrito.\n\nFaça login no painel e vincule:\n/link SEU_TOKEN"
-        );
+        await sendText(tg, chatId, "🔒 Acesso restrito.\n\nVincule no painel:\n/link SEU_TOKEN");
         return res.json({ ok: true });
       }
 
@@ -191,76 +210,96 @@ async function handleUpdate(tg, cfg, req, res) {
       return res.json({ ok: true });
     }
 
-    // ============================
-    // MODO PÚBLICO (LOCK OFF)
-    // ============================
-    const pr = pickPriority(text);
-    const badge = priorityBadge(pr);
-    const title = buildTitle(text);
+    // =====================================================
+    // MODO PÚBLICO (LOCK OFF) — CRIA TASK + NOTIFICA
+    // =====================================================
     const userLabel = fmtUserLabel(msg);
 
-    // 🔥 Campos que o OfficePanel costuma ler:
-    // - message (não ficar "(sem mensagem)")
-    // - by / createdBy (não ficar "De: —")
+    // prioridade via /p ou detecção por texto
+    const parsed = parsePriorityFromCommand(rawText);
+    const pr = normalizePriority(parsed.priority || detectPriorityFromText(parsed.cleanText));
+    const badge = priorityBadge(pr);
+
+    // mensagem final que vai para o Office
+    const finalText = safeText(parsed.cleanText) || safeText(rawText) || "(sem texto)";
+    const title = buildTitle(finalText);
+
+    // by/createdBy para preencher "De:"
     const by = {
       uid: `tg:${fromId || "unknown"}`,
-      name: userLabel,
+      name: userLabel, // <- isso já preencheu seu "De: Wendell | id..."
       email: null,
       source: "telegram",
+      telegramUserId: fromId || null,
+      telegramChatId: chatId,
     };
 
+    // SALVAR NO FIRESTORE com redundância máxima:
+    // (a sua UI pode ler qualquer um desses)
     let createdId = null;
 
     if (tasksCol) {
       const docRef = await tasksCol.add({
-        // UI: mensagem + autor
-        message: text || "",
+        // campos "prováveis" que sua UI usa
+        message: finalText,
+        text: finalText,
+        content: finalText,
+        body: finalText,
+        description: finalText,
+        title,
+
+        // autor (pra UI)
         by,
         createdBy: by,
+        requester: by,
+        from: by,
+        fromLabel: userLabel,
 
-        // extras
-        title,
-        description: text || "",
-
-        priority: normalizePriority(pr),
+        // status e prioridade
         status: "aberta",
+        priority: pr,
 
+        // compat com officeSignal
         officeSignal: null,
         officeComment: "",
+        officeSignaledAt: null,
 
+        // timestamps
         createdAt: nowTS(),
         updatedAt: nowTS(),
 
+        // rastreio
         source: "telegram_public",
         telegram: {
+          rawText: rawText,
+          cleanText: finalText,
+          priority: pr,
           fromId: fromId || null,
           chatId,
           userLabel,
-          rawText: text || "",
         },
       });
 
       createdId = docRef?.id || null;
     }
 
-    // encaminha pro MASTER e pro OFFICE (Telegram)
+    // NOTIFICAR TELEGRAM (MASTER + OFFICE)
     const payloadHtml =
       `📩 <b>${badge}</b>\n` +
       `<b>Tarefa:</b> ${title}\n` +
       `<b>De:</b> ${userLabel}\n\n` +
-      `<b>Mensagem:</b>\n${text || "(sem texto)"}\n` +
+      `<b>Mensagem:</b>\n${finalText}\n` +
       (createdId ? `\n<b>ID:</b> <code>${createdId}</code>\n` : "");
 
     if (masterChatId) await sendText(tg, masterChatId, payloadHtml, { parse_mode: "HTML" });
     if (officeChatId) await sendText(tg, officeChatId, payloadHtml, { parse_mode: "HTML" });
 
-    // responde pro usuário
+    // responder usuário
     const reply =
       `✅ Recebido! Já enviei para o escritório.\n\n` +
       `📌 Prioridade: ${badge}\n` +
       (createdId ? `🧾 Protocolo: ${createdId}\n\n` : "\n") +
-      `Para definir prioridade, envie:\n` +
-      `/p baixa | /p media | /p alta | /p urgente`;
+      `Para definir prioridade:\n/p baixa | /p media | /p alta | /p urgente`;
 
     await sendText(tg, chatId, reply);
 
