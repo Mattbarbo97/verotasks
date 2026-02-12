@@ -11,6 +11,7 @@ function isAuthLockOn(cfg) {
 }
 
 async function sendText(tg, chatId, text, opts = {}) {
+  if (!chatId) return;
   return tg.post("/sendMessage", {
     chat_id: chatId,
     text,
@@ -52,6 +53,7 @@ async function handleUpdate(tg, cfg, req, res) {
       const secretHeader =
         req.headers["x-telegram-bot-api-secret-token"] ||
         req.headers["X-Telegram-Bot-Api-Secret-Token"];
+
       if (secretHeader && String(secretHeader) !== String(cfg.TELEGRAM_WEBHOOK_SECRET)) {
         return res.status(401).json({ ok: false });
       }
@@ -61,8 +63,9 @@ async function handleUpdate(tg, cfg, req, res) {
 
     const lockOn = isAuthLockOn(cfg);
     const masterChatId = String(cfg.MASTER_CHAT_ID || "").trim();
+    const officeChatId = String(cfg.OFFICE_CHAT_ID || "").trim(); // ✅ NOVO
 
-    // ====== HELP ======
+    // HELP
     if (text === "/start" || text === "/help") {
       if (lockOn) {
         await sendText(
@@ -80,14 +83,12 @@ async function handleUpdate(tg, cfg, req, res) {
       return res.json({ ok: true });
     }
 
-    // ====== LINK (se quiser manter compatível) ======
-    // Se lock ON, exige token; se lock OFF, você pode ignorar /link (ou manter).
+    // LINK (mantém compatível)
     const linkMatch = text.match(/^\/link(?:@[\w_]+)?\s+(\S+)\s*$/i);
     if (linkMatch && linkMatch[1]) {
       const tokenId = String(linkMatch[1]).trim();
 
       if (!lockOn) {
-        // em modo público, não precisamos de link.
         await sendText(
           tg,
           chatId,
@@ -96,7 +97,6 @@ async function handleUpdate(tg, cfg, req, res) {
         return res.json({ ok: true });
       }
 
-      // lock ON: valida token real (se existir linkTokensCol)
       if (!linkTokensCol) {
         await sendText(tg, chatId, "❌ Vinculação indisponível (linkTokensCol não configurado).");
         return res.json({ ok: true });
@@ -164,7 +164,7 @@ async function handleUpdate(tg, cfg, req, res) {
       return res.json({ ok: true });
     }
 
-    // ====== Se LOCK ON: exige vínculo ======
+    // ====== LOCK ON: exige vínculo
     if (lockOn) {
       const linkedSnap = await usersCol.where("telegramChatId", "==", chatId).limit(1).get();
       const isLinked = !linkedSnap.empty;
@@ -178,29 +178,31 @@ async function handleUpdate(tg, cfg, req, res) {
         return res.json({ ok: true });
       }
 
-      // vinculado: responde OK (ou continue seu fluxo normal)
       await sendText(tg, chatId, "✅ Ok! Estou online.");
       return res.json({ ok: true });
     }
 
-    // ====== MODO PÚBLICO (AUTH_LOCK OFF): aceita de qualquer um ======
+    // ====== AUTH_LOCK OFF: modo público (aceita qualquer um)
     const userLabel = fmtUserLabel(msg);
     const chatLabel = fmtChatLabel(msg);
 
-    // 1) encaminha pro master
-    if (masterChatId) {
-      const forwarded =
-        `📩 <b>Solicitação (PÚBLICO)</b>\n` +
-        `<b>De:</b> ${userLabel}\n` +
-        `<b>Chat:</b> ${chatLabel}\n\n` +
-        `<b>Mensagem:</b>\n${text || "(sem texto)"}\n\n` +
-        `<i>Responda manualmente a pessoa no Telegram se precisar.</i>`;
+    const payloadHtml =
+      `📩 <b>Solicitação (PÚBLICO)</b>\n` +
+      `<b>De:</b> ${userLabel}\n` +
+      `<b>Chat:</b> ${chatLabel}\n\n` +
+      `<b>Mensagem:</b>\n${text || "(sem texto)"}\n`;
 
-      // usa HTML pra ficar bonito
-      await sendText(tg, masterChatId, forwarded, { parse_mode: "HTML" });
+    // 1) encaminha pro MASTER
+    if (masterChatId) {
+      await sendText(tg, masterChatId, payloadHtml, { parse_mode: "HTML" });
     }
 
-    // 2) opcional: cria task no Firestore (se tasksCol existir)
+    // 2) encaminha pro OFFICE também ✅
+    if (officeChatId) {
+      await sendText(tg, officeChatId, payloadHtml, { parse_mode: "HTML" });
+    }
+
+    // 3) opcional: cria task no Firestore (se tasksCol existir)
     if (tasksCol) {
       try {
         await tasksCol.add({
@@ -217,14 +219,18 @@ async function handleUpdate(tg, cfg, req, res) {
             userLabel,
             chatLabel,
           },
+          // útil para UI/relatórios
+          deliveredTo: {
+            master: !!masterChatId,
+            office: !!officeChatId,
+          },
         });
       } catch (e) {
-        // não quebra o bot
         console.error("[telegram_public] failed to create task:", e?.message || e);
       }
     }
 
-    // 3) confirma pro usuário
+    // 4) confirma pro usuário
     await sendText(
       tg,
       chatId,
