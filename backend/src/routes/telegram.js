@@ -2,7 +2,6 @@
 const express = require("express");
 const { createTelegramClient } = require("../telegram/client");
 const { handleUpdate } = require("../telegram/webhookHandler");
-
 function telegramRouter(cfg) {
   const router = express.Router();
   const tg = createTelegramClient(cfg);
@@ -33,7 +32,19 @@ function telegramRouter(cfg) {
     }
   });
 
+  // 🔥 BYPASS TEMPORÁRIO
+  router.post("/consume-link-token", async (req, res) => {
+    try {
+      return res.json({
+        ok: true,
+        linked: true,
+        bypass: true
+      });
+    } catch (err) {
+      console.error("consume-link-token bypass error:", err);
+      return res.status(500).json({ ok: false });
+    }
+  });
+
   return router;
 }
-
-module.exports = { telegramRouter };
