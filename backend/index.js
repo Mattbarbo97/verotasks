@@ -51,20 +51,14 @@ function buildCfgFromEnv(env) {
 // ============================
 function pickExport(mod) {
   if (!mod) return null;
-  // se exportou objeto
-  return mod.router || mod.officeRouter || mod.adminRouter || mod.default || mod;
+  return mod.router || mod.officeRouter || mod.adminRouter || mod.telegramRouter || mod.default || mod;
 }
 
-// ============================
-// Validação profunda: detecta handlers undefined
-// ============================
 function assertRouterValid(router, name) {
   if (!router) throw new Error(`${name}: router é null/undefined`);
 
-  // Router do Express é uma função middleware + tem stack
   const stack = router.stack;
   if (!Array.isArray(stack)) {
-    // ainda pode ser middleware puro
     if (typeof router !== "function") {
       throw new Error(`${name}: não é function e não tem stack`);
     }
@@ -72,7 +66,6 @@ function assertRouterValid(router, name) {
   }
 
   for (const layer of stack) {
-    // layer.route -> endpoints (get/post/etc)
     if (layer && layer.route && Array.isArray(layer.route.stack)) {
       for (const r of layer.route.stack) {
         if (!r || typeof r.handle !== "function") {
@@ -84,9 +77,8 @@ function assertRouterValid(router, name) {
       continue;
     }
 
-    // router.use(...) (middlewares)
     if (!layer || typeof layer.handle !== "function") {
-      throw new Error(`${name}: middleware inválido (router.use com handler undefined?)`);
+      throw new Error(`${name}: middleware inválido`);
     }
   }
 }
@@ -105,51 +97,13 @@ const initFn =
   fbAdminMod.default;
 
 if (typeof initFn !== "function") {
-  throw new Error(
-    "Firebase init inválido: ./src/firebase/admin não exporta initFirebaseAdmin/initFirebase/init/default"
-  );
+  throw new Error("Firebase init inválido");
 }
 
 initFn(cfg);
 
-// ✅ Telegram
-const { createTelegramClient } = require("./src/telegram/client");
-const { handleUpdate } = require("./src/telegram/webhookHandler");
-const tgClient = createTelegramClient(cfg);
-
-// deps que rotas podem precisar
-const deps = { tgClient };
-
 // ============================
-// Routes (factory(cfg, deps) OU router pronto)
-// ============================
-function buildRouter(modPath, name) {
-  const mod = require(modPath);
-  const exp = pickExport(mod);
-
-  // 1) Se exportou função "factory", chama com (cfg, deps)
-  if (typeof exp === "function" && exp.stack === undefined) {
-    // factory normal (não é router express)
-    const out =
-      exp.length >= 2 ? exp(cfg, deps) : exp(cfg); // se aceitar deps, passa
-    assertRouterValid(out, name);
-    return out;
-  }
-
-  // 2) Se exportou router (tem stack)
-  if (exp && (typeof exp === "function" || typeof exp === "object")) {
-    assertRouterValid(exp, name);
-    return exp;
-  }
-
-  throw new Error(`${name}: export inválido`);
-}
-
-const officeRouter = buildRouter("./src/routes/office", "officeRouter");
-const adminRouter = buildRouter("./src/routes/admin", "adminRouter");
-
-// ============================
-// Express app
+// Express
 // ============================
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -171,24 +125,30 @@ app.use(
   })
 );
 
+// ============================
+// Routes
+// ============================
+const officeRouter = require("./src/routes/office").officeRouter;
+const adminRouter = require("./src/routes/admin").adminRouter;
+const { telegramRouter } = require("./src/routes/telegram");
+
+// Health
 app.get("/health", (req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// Office/Admin
-app.use("/office", officeRouter);
-app.use("/admin", adminRouter);
+// Office / Admin
+app.use("/office", officeRouter(cfg));
+app.use("/admin", adminRouter(cfg));
 
-// Telegram webhook
-app.post("/telegram/webhook", (req, res) => {
-  return handleUpdate(tgClient, cfg, req, res);
-});
+// 🔥 Telegram COMPLETO agora
+app.use("/telegram", telegramRouter(cfg));
 
-app.get("/telegram", (req, res) => {
-  res.json({ ok: true, route: "telegram", ts: new Date().toISOString() });
-});
-
+// ============================
+// Start
+// ============================
 const PORT = Number(cfg.PORT || 10000);
+
 app.listen(PORT, () => {
   console.log("✅ VeroTasks Backend online");
   console.log("→ Port:", PORT);
