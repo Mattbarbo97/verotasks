@@ -2,9 +2,6 @@
 const { collections } = require("../firebase/collections");
 const { nowTS } = require("../services/awaiting");
 
-// =========================================================
-// Utils
-// =========================================================
 function safeText(v) {
   return String(v || "").trim();
 }
@@ -15,8 +12,7 @@ function isAuthLockOn(cfg) {
 
 async function sendText(tg, chatId, text, opts = {}) {
   if (!chatId) return null;
-  const payload = { chat_id: chatId, text, ...opts };
-  return tg.post("/sendMessage", payload);
+  return tg.post("/sendMessage", { chat_id: chatId, text, ...opts });
 }
 
 function fmtUserLabel(msg) {
@@ -25,14 +21,6 @@ function fmtUserLabel(msg) {
   const user = u.username ? `@${u.username}` : "";
   const id = u.id ? `id:${u.id}` : "";
   return [name || user || id || "desconhecido", user, id].filter(Boolean).join(" | ");
-}
-
-function fmtChatLabel(msg) {
-  const c = msg?.chat || {};
-  const title = c.title ? `“${c.title}”` : "";
-  const id = c.id ? `chat:${c.id}` : "";
-  const type = c.type ? `type:${c.type}` : "";
-  return [title, id, type].filter(Boolean).join(" | ");
 }
 
 function normalizePriority(p) {
@@ -46,7 +34,6 @@ function normalizePriority(p) {
 
 function parsePriorityCommand(text) {
   const t = safeText(text);
-  // /p alta | /prioridade urgente
   const m = t.match(/^\/(?:p|prioridade)\s+(baixa|media|m[eé]dia|alta|urgente|critica|cr[ií]tica)\s*$/i);
   if (!m) return null;
   return normalizePriority(m[1]);
@@ -54,25 +41,15 @@ function parsePriorityCommand(text) {
 
 function detectPriorityFromText(text) {
   const t = safeText(text).toLowerCase();
-
-  // emojis
-  if (t.includes("🔥") || t.includes("🚨") || t.includes("❗") || t.includes("⚠")) {
-    // se tem "urg" ou "crít" assume urgente
-    if (t.includes("urg") || t.includes("crít") || t.includes("crit")) return "urgente";
-    return "alta";
-  }
-
-  // palavras-chave
   if (/(urgente|cr[ií]tico|critico|cr[ií]tica|emerg[eê]ncia|emergencia|parou|travou|fora do ar)/.test(t)) {
     return "urgente";
   }
-  if (/(prioridade\s*alta|alta\s*prioridade|alta|importante|hoje|agora)/.test(t)) {
+  if (/(prioridade\s*alta|alta\s*prioridade|importante|hoje|agora)/.test(t)) {
     return "alta";
   }
   if (/(sem pressa|quando der|baixa prioridade|depois)/.test(t)) {
     return "baixa";
   }
-
   return "media";
 }
 
@@ -80,10 +57,9 @@ function pickPriority(text) {
   return parsePriorityCommand(text) || detectPriorityFromText(text);
 }
 
-function buildTitleFromMessage(text) {
+function buildTitle(text) {
   const t = safeText(text);
   if (!t) return "Solicitação via Telegram";
-  // remove comandos como /p alta
   const cleaned = t.replace(/^\/(?:p|prioridade)\s+\S+\s*/i, "").trim();
   return (cleaned || t).slice(0, 80);
 }
@@ -96,11 +72,8 @@ function priorityBadge(p) {
   return "🟡 MÉDIA";
 }
 
-// =========================================================
-// Rate limit simples em memória (anti-spam básico)
-// - 1 msg a cada 3s por userId (telegram from.id)
-// =========================================================
-const RL = new Map(); // key -> { lastMs }
+// rate limit simples (anti-flood)
+const RL = new Map();
 function hitRateLimit(key, minIntervalMs) {
   const now = Date.now();
   const cur = RL.get(key) || { lastMs: 0 };
@@ -109,14 +82,10 @@ function hitRateLimit(key, minIntervalMs) {
   return false;
 }
 
-// =========================================================
-// Handler
-// =========================================================
 async function handleUpdate(tg, cfg, req, res) {
   try {
     const update = req.body || {};
     const msg = update.message || update.edited_message || null;
-
     if (!msg) return res.json({ ok: true });
 
     const chatId = msg?.chat?.id;
@@ -125,52 +94,43 @@ async function handleUpdate(tg, cfg, req, res) {
 
     if (!chatId) return res.json({ ok: true });
 
-    // Secret token do webhook (se estiver usando)
+    // webhook secret (se usar)
     if (cfg.TELEGRAM_WEBHOOK_SECRET) {
       const secretHeader =
         req.headers["x-telegram-bot-api-secret-token"] ||
         req.headers["X-Telegram-Bot-Api-Secret-Token"];
-
       if (secretHeader && String(secretHeader) !== String(cfg.TELEGRAM_WEBHOOK_SECRET)) {
         return res.status(401).json({ ok: false });
       }
     }
 
     const lockOn = isAuthLockOn(cfg);
-    const masterChatId = String(cfg.MASTER_CHAT_ID || "").trim(); // Wendell aqui
+    const masterChatId = String(cfg.MASTER_CHAT_ID || "").trim(); // Wendell
     const officeChatId = String(cfg.OFFICE_CHAT_ID || "").trim();
 
     const { usersCol, tasksCol, linkTokensCol } = collections();
 
-    // HELP
+    // /start /help
     if (text === "/start" || text === "/help") {
-      const help =
-        "✅ VeroBot — Solicitações\n\n" +
-        "Envie sua solicitação normalmente.\n\n" +
-        "Prioridade (opcional):\n" +
-        "• /p baixa\n" +
-        "• /p media\n" +
-        "• /p alta\n" +
-        "• /p urgente\n\n" +
-        "Exemplo:\n" +
-        "/p urgente\n" +
-        "Sistema travou e não imprime!";
-      await sendText(tg, chatId, help);
+      await sendText(
+        tg,
+        chatId,
+        "✅ VeroBot\n\nEnvie a solicitação normalmente.\n\nPrioridade:\n/p baixa | /p media | /p alta | /p urgente\n\nEx:\n/p urgente\nSistema travou!"
+      );
       return res.json({ ok: true });
     }
 
-    // Rate limit (evita flood)
-    if (fromId && hitRateLimit(`u:${fromId}`, 3000)) {
-      await sendText(tg, chatId, "⏳ Aguarde 3s e envie novamente.");
+    // anti-flood
+    if (fromId && hitRateLimit(`u:${fromId}`, 2500)) {
+      await sendText(tg, chatId, "⏳ Aguarde 2s e tente novamente.");
       return res.json({ ok: true });
     }
 
-    // Se AUTH_LOCK ON, mantém restrito (somente vinculados)
+    // LOCK ON (mantém restrito)
     if (lockOn) {
       const linkedSnap = await usersCol.where("telegramChatId", "==", chatId).limit(1).get();
       const isLinked = !linkedSnap.empty;
 
-      // mantém /link funcionando se você quiser (opcional)
       const linkMatch = text.match(/^\/link(?:@[\w_]+)?\s+(\S+)\s*$/i);
       if (!isLinked && linkMatch && linkMatch[1]) {
         const tokenId = String(linkMatch[1]).trim();
@@ -181,12 +141,12 @@ async function handleUpdate(tg, cfg, req, res) {
         const tokenRef = linkTokensCol.doc(tokenId);
         const tokenSnap = await tokenRef.get();
         if (!tokenSnap.exists) {
-          await sendText(tg, chatId, "❌ Token inválido. Gere outro no painel e tente novamente.");
+          await sendText(tg, chatId, "❌ Token inválido. Gere outro no painel.");
           return res.json({ ok: true });
         }
         const tokenDoc = tokenSnap.data() || {};
         if (tokenDoc.consumedAt) {
-          await sendText(tg, chatId, "⚠️ Esse token já foi usado. Gere outro no painel.");
+          await sendText(tg, chatId, "⚠️ Token já usado. Gere outro no painel.");
           return res.json({ ok: true });
         }
         const uid = String(tokenDoc.uid || "").trim();
@@ -194,14 +154,8 @@ async function handleUpdate(tg, cfg, req, res) {
           await sendText(tg, chatId, "❌ Token inválido (sem UID).");
           return res.json({ ok: true });
         }
-        const userRef = usersCol.doc(uid);
-        const userSnap = await userRef.get();
-        if (!userSnap.exists) {
-          await sendText(tg, chatId, "❌ Usuário não encontrado no sistema.");
-          return res.json({ ok: true });
-        }
 
-        await userRef.set(
+        await usersCol.doc(uid).set(
           {
             telegramUserId: fromId || null,
             telegramChatId: chatId,
@@ -220,7 +174,7 @@ async function handleUpdate(tg, cfg, req, res) {
           { merge: true }
         );
 
-        await sendText(tg, chatId, "✅ Telegram vinculado com sucesso!");
+        await sendText(tg, chatId, "✅ Telegram vinculado!");
         return res.json({ ok: true });
       }
 
@@ -228,87 +182,84 @@ async function handleUpdate(tg, cfg, req, res) {
         await sendText(
           tg,
           chatId,
-          "🔒 Acesso restrito.\n\nFaça login no painel e vincule seu Telegram:\n/link SEU_TOKEN"
+          "🔒 Acesso restrito.\n\nFaça login no painel e vincule:\n/link SEU_TOKEN"
         );
         return res.json({ ok: true });
       }
-      // vinculado — aqui você poderia tratar comandos internos
+
       await sendText(tg, chatId, "✅ Ok! Envie sua solicitação.");
       return res.json({ ok: true });
     }
 
-    // ============================================
-    // MODO PÚBLICO (AUTH_LOCK OFF): cria tarefa
-    // ============================================
+    // ============================
+    // MODO PÚBLICO (LOCK OFF)
+    // ============================
     const pr = pickPriority(text);
-    const title = buildTitleFromMessage(text);
-    const userLabel = fmtUserLabel(msg);
-    const chatLabel = fmtChatLabel(msg);
     const badge = priorityBadge(pr);
+    const title = buildTitle(text);
+    const userLabel = fmtUserLabel(msg);
 
-    // 1) salvar no Firestore (pra aparecer no OfficePanel)
+    // 🔥 Campos que o OfficePanel costuma ler:
+    // - message (não ficar "(sem mensagem)")
+    // - by / createdBy (não ficar "De: —")
+    const by = {
+      uid: `tg:${fromId || "unknown"}`,
+      name: userLabel,
+      email: null,
+      source: "telegram",
+    };
+
     let createdId = null;
+
     if (tasksCol) {
-      try {
-        const docRef = await tasksCol.add({
-          title,
-          message: text,
-          description: text,
+      const docRef = await tasksCol.add({
+        // UI: mensagem + autor
+        message: text || "",
+        by,
+        createdBy: by,
 
-          priority: pr,           // baixa | media | alta | urgente
-          status: "aberta",       // padrão
-          createdAt: nowTS(),
-          updatedAt: nowTS(),
+        // extras
+        title,
+        description: text || "",
 
-          // útil pra UI não ficar "De: —"
-          fromLabel: userLabel,
-          fromChatId: chatId,
-          fromUserId: fromId || null,
+        priority: normalizePriority(pr),
+        status: "aberta",
 
-          source: "telegram_public",
+        officeSignal: null,
+        officeComment: "",
 
-          telegram: {
-            fromId: fromId || null,
-            chatId,
-            userLabel,
-            chatLabel,
-            rawText: text,
-          },
+        createdAt: nowTS(),
+        updatedAt: nowTS(),
 
-          deliveredTo: {
-            masterChatId: masterChatId || null,
-            officeChatId: officeChatId || null,
-          },
-        });
+        source: "telegram_public",
+        telegram: {
+          fromId: fromId || null,
+          chatId,
+          userLabel,
+          rawText: text || "",
+        },
+      });
 
-        createdId = docRef?.id || null;
-      } catch (e) {
-        console.error("[telegram_public] failed to create task:", e?.message || e);
-      }
+      createdId = docRef?.id || null;
     }
 
-    // 2) notificar MASTER + OFFICE
+    // encaminha pro MASTER e pro OFFICE (Telegram)
     const payloadHtml =
       `📩 <b>${badge}</b>\n` +
       `<b>Tarefa:</b> ${title}\n` +
-      `<b>De:</b> ${userLabel}\n` +
-      `<b>Chat:</b> ${chatLabel}\n\n` +
+      `<b>De:</b> ${userLabel}\n\n` +
       `<b>Mensagem:</b>\n${text || "(sem texto)"}\n` +
       (createdId ? `\n<b>ID:</b> <code>${createdId}</code>\n` : "");
 
-    if (masterChatId) {
-      await sendText(tg, masterChatId, payloadHtml, { parse_mode: "HTML" });
-    }
-    if (officeChatId) {
-      await sendText(tg, officeChatId, payloadHtml, { parse_mode: "HTML" });
-    }
+    if (masterChatId) await sendText(tg, masterChatId, payloadHtml, { parse_mode: "HTML" });
+    if (officeChatId) await sendText(tg, officeChatId, payloadHtml, { parse_mode: "HTML" });
 
-    // 3) responder pro usuário (confirmando + prioridade)
+    // responde pro usuário
     const reply =
-      `✅ Recebido! Já encaminhei sua solicitação.\n\n` +
+      `✅ Recebido! Já enviei para o escritório.\n\n` +
       `📌 Prioridade: ${badge}\n` +
       (createdId ? `🧾 Protocolo: ${createdId}\n\n` : "\n") +
-      `Se quiser mudar a prioridade, envie:\n` +
+      `Para definir prioridade, envie:\n` +
       `/p baixa | /p media | /p alta | /p urgente`;
 
     await sendText(tg, chatId, reply);
@@ -316,7 +267,6 @@ async function handleUpdate(tg, cfg, req, res) {
     return res.json({ ok: true });
   } catch (err) {
     console.error("[telegram][webhookHandler] error:", err);
-    // sempre 200 para não ficar reenviando update
     return res.status(200).json({ ok: true });
   }
 }
