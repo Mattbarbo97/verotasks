@@ -1,15 +1,18 @@
-// src/routes/telegram.js
+// backend/src/routes/telegram.js
 const express = require("express");
 const { createTelegramClient } = require("../telegram/client");
 const { handleUpdate } = require("../telegram/webhookHandler");
+
 function telegramRouter(cfg) {
   const router = express.Router();
   const tg = createTelegramClient(cfg);
 
+  // Webhook do Telegram
   router.post("/webhook", async (req, res) => {
     return handleUpdate(tg, cfg, req, res);
   });
 
+  // Set webhook
   router.post("/setWebhook", async (_, res) => {
     try {
       const url = `${cfg.BASE_URL}/telegram/webhook`;
@@ -17,28 +20,29 @@ function telegramRouter(cfg) {
         url,
         secret_token: cfg.TELEGRAM_WEBHOOK_SECRET,
       });
-      res.json(data);
+      return res.json(data);
     } catch (e) {
-      res.status(500).json({ ok: false, error: e?.message });
+      return res.status(500).json({ ok: false, error: e?.message });
     }
   });
 
+  // Delete webhook
   router.post("/deleteWebhook", async (_, res) => {
     try {
       const { data } = await tg.post("/deleteWebhook", {});
-      res.json(data);
+      return res.json(data);
     } catch (e) {
-      res.status(500).json({ ok: false, error: e?.message });
+      return res.status(500).json({ ok: false, error: e?.message });
     }
   });
 
-  // 🔥 BYPASS TEMPORÁRIO
-  router.post("/consume-link-token", async (req, res) => {
+  // 🔥 BYPASS TEMPORÁRIO — libera agora sem vínculo real
+  router.post("/consume-link-token", async (_req, res) => {
     try {
       return res.json({
         ok: true,
         linked: true,
-        bypass: true
+        bypass: true,
       });
     } catch (err) {
       console.error("consume-link-token bypass error:", err);
@@ -48,3 +52,5 @@ function telegramRouter(cfg) {
 
   return router;
 }
+
+module.exports = { telegramRouter };

@@ -16,7 +16,6 @@ function parseServiceAccountFromEnv(env) {
   const s = String(raw || "").trim();
   if (!s) return null;
 
-  // JSON direto
   if (s.startsWith("{") && s.endsWith("}")) {
     const obj = JSON.parse(s);
     if (obj.private_key && typeof obj.private_key === "string") {
@@ -25,7 +24,6 @@ function parseServiceAccountFromEnv(env) {
     return obj;
   }
 
-  // Base64
   try {
     const decoded = Buffer.from(s, "base64").toString("utf8").trim();
     if (decoded.startsWith("{") && decoded.endsWith("}")) {
@@ -46,49 +44,11 @@ function buildCfgFromEnv(env) {
   return cfg;
 }
 
-// ============================
-// Router loader
-// ============================
-function pickExport(mod) {
-  if (!mod) return null;
-  return mod.router || mod.officeRouter || mod.adminRouter || mod.telegramRouter || mod.default || mod;
-}
-
-function assertRouterValid(router, name) {
-  if (!router) throw new Error(`${name}: router é null/undefined`);
-
-  const stack = router.stack;
-  if (!Array.isArray(stack)) {
-    if (typeof router !== "function") {
-      throw new Error(`${name}: não é function e não tem stack`);
-    }
-    return;
-  }
-
-  for (const layer of stack) {
-    if (layer && layer.route && Array.isArray(layer.route.stack)) {
-      for (const r of layer.route.stack) {
-        if (!r || typeof r.handle !== "function") {
-          const methods = Object.keys(layer.route.methods || {}).join(",") || "unknown";
-          const path = layer.route.path || "(unknown)";
-          throw new Error(`${name}: handler inválido em route ${methods.toUpperCase()} ${path}`);
-        }
-      }
-      continue;
-    }
-
-    if (!layer || typeof layer.handle !== "function") {
-      throw new Error(`${name}: middleware inválido`);
-    }
-  }
-}
-
-// ============================
-// Boot
-// ============================
 const cfg = buildCfgFromEnv(process.env);
 
-// ✅ Firebase Admin init
+// ============================
+// Firebase Admin
+// ============================
 const fbAdminMod = require("./src/firebase/admin");
 const initFn =
   fbAdminMod.initFirebaseAdmin ||
@@ -101,6 +61,13 @@ if (typeof initFn !== "function") {
 }
 
 initFn(cfg);
+
+// ============================
+// Telegram Client (deps)
+// ============================
+const { createTelegramClient } = require("./src/telegram/client");
+const tgClient = createTelegramClient(cfg);
+const deps = { tgClient };
 
 // ============================
 // Express
@@ -128,20 +95,28 @@ app.use(
 // ============================
 // Routes
 // ============================
-const officeRouter = require("./src/routes/office").officeRouter;
-const adminRouter = require("./src/routes/admin").adminRouter;
+
+// office.js exporta: module.exports = function officeRouter(cfg, deps)
+const officeRouter = require("./src/routes/office");
+
+// admin.js exporta: module.exports = { adminRouter }
+const { adminRouter } = require("./src/routes/admin");
+
+// telegram.js precisa exportar: module.exports = { telegramRouter }
 const { telegramRouter } = require("./src/routes/telegram");
 
-// Health
+// Health check
 app.get("/health", (req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// Office / Admin
-app.use("/office", officeRouter(cfg));
+// Office
+app.use("/office", officeRouter(cfg, deps));
+
+// Admin
 app.use("/admin", adminRouter(cfg));
 
-// 🔥 Telegram COMPLETO agora
+// Telegram (webhook + consume-link-token)
 app.use("/telegram", telegramRouter(cfg));
 
 // ============================
