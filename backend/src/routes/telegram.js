@@ -7,14 +7,18 @@ function telegramRouter(cfg) {
   const router = express.Router();
   const tg = createTelegramClient(cfg);
 
-  // Webhook do Telegram
+  // Webhook do Telegram (messages + callback_query)
   router.post("/webhook", async (req, res) => {
     return handleUpdate(tg, cfg, req, res);
   });
 
   // Set webhook
-  router.post("/setWebhook", async (_, res) => {
+  router.post("/setWebhook", async (_req, res) => {
     try {
+      if (!cfg.BASE_URL) {
+        return res.status(400).json({ ok: false, error: "Missing BASE_URL" });
+      }
+
       const url = `${cfg.BASE_URL}/telegram/webhook`;
       const { data } = await tg.post("/setWebhook", {
         url,
@@ -27,7 +31,7 @@ function telegramRouter(cfg) {
   });
 
   // Delete webhook
-  router.post("/deleteWebhook", async (_, res) => {
+  router.post("/deleteWebhook", async (_req, res) => {
     try {
       const { data } = await tg.post("/deleteWebhook", {});
       return res.json(data);
@@ -36,9 +40,14 @@ function telegramRouter(cfg) {
     }
   });
 
-  // 🔥 BYPASS TEMPORÁRIO — libera agora sem vínculo real
+  // 🔥 BYPASS (somente se habilitado por env)
   router.post("/consume-link-token", async (_req, res) => {
     try {
+      const bypassOn = String(cfg.LINK_BYPASS || "").toUpperCase() === "ON";
+      if (!bypassOn) {
+        return res.status(403).json({ ok: false, error: "bypass_disabled" });
+      }
+
       return res.json({
         ok: true,
         linked: true,
