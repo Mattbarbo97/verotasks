@@ -6,8 +6,8 @@ const {
   TELEGRAM_BOT_TOKEN,
   MASTER_CHAT_ID,
 
-  MASTER_API_SECRET,          // usado pra chamar /master/respond
-  API_BASE_URL,               // ex: https://seu-backend.onrender.com
+  MASTER_API_SECRET, // usado pra chamar /master/respond
+  API_BASE_URL, // ex: https://seu-backend.onrender.com
 
   FIREBASE_SERVICE_ACCOUNT_JSON,
 } = process.env;
@@ -36,31 +36,103 @@ function safeStr(x, max = 1200) {
   return s.length > max ? s.slice(0, max) : s;
 }
 
-function taskText(taskId, data) {
-  const title = safeStr(data.title || "—", 200);
-  const signal = data.officeSignal || "—";
-  const note = safeStr(data.officeNote || "", 800);
+function normalizeOfficeSignal(sig) {
+  // Suporta string (legado) e objeto {state, comment}
+  if (!sig) return { state: "", comment: "" };
+  if (typeof sig === "string") return { state: sig, comment: "" };
+  if (typeof sig === "object") {
+    return {
+      state: safeStr(sig.state || "", 60),
+      comment: safeStr(sig.comment || "", 1200),
+    };
+  }
+  return { state: "", comment: "" };
+}
 
-  const status = data.status || "aberta";
-  const masterNote = safeStr(data.masterNote || "", 800);
+function normalizePriority(p) {
+  const s = String(p || "").toLowerCase().trim();
+  if (s === "urgente") return "urgente";
+  if (s === "alta") return "alta";
+  if (s === "baixa") return "baixa";
+  return "media";
+}
+
+function prBadge(p) {
+  const pr = normalizePriority(p);
+  if (pr === "urgente") return "🔴 URGENTE";
+  if (pr === "alta") return "🟠 ALTA";
+  if (pr === "baixa") return "🟢 BAIXA";
+  return "🟡 MÉDIA";
+}
+
+function isClosedStatus(status) {
+  return ["feito", "feito_detalhes", "deu_ruim"].includes(String(status || ""));
+}
+
+function toMs(ts) {
+  try {
+    if (!ts) return 0;
+    if (typeof ts.toMillis === "function") return ts.toMillis();
+    if (typeof ts.toDate === "function") return ts.toDate().getTime();
+    return 0;
+  } catch {
+    return 0;
+  }
+}
+
+function taskPreview(data) {
+  return (
+    safeStr(data?.message, 120) ||
+    safeStr(data?.description, 120) ||
+    safeStr(data?.title, 120) ||
+    safeStr(data?.telegram?.cleanText, 120) ||
+    safeStr(data?.telegram?.rawText, 120) ||
+    "—"
+  );
+}
+
+function taskText(taskId, data) {
+  const title = safeStr(data.title || "", 160);
+  const preview = taskPreview(data);
+
+  const status = safeStr(data.status || "aberta", 40);
+  const priority = prBadge(data.priority);
+
+  const createdBy = safeStr(data?.createdBy?.name || data?.by?.name || "", 120) || "—";
+
+  const sig = normalizeOfficeSignal(data.officeSignal);
+  const sigState = sig.state || "—";
+  const sigComment = sig.comment || safeStr(data.officeComment || "", 900);
+
+  const officeAt = toMs(data.officeSignaledAt);
+  const createdAt = toMs(data.createdAt);
 
   let msg = `🧾 *Tarefa*\n`;
   msg += `• ID: \`${taskId}\`\n`;
-  msg += `• Título: *${title}*\n`;
-  msg += `• Sinal: *${signal}*\n`;
-  if (note) msg += `• Nota: ${note}\n`;
-  msg += `\n📌 Status atual: *${status}*\n`;
-  if (masterNote) msg += `💬 Última resposta: ${masterNote}\n`;
+  msg += `• Prioridade: *${priority}*\n`;
+  msg += `• De: *${safeStr(createdBy, 120)}*\n`;
+  msg += `• Status: *${status}*\n`;
+  msg += `\n📝 *${title || preview}*\n`;
+
+  msg += `\n🚦 *Sinal do escritório:* *${safeStr(sigState, 80)}*\n`;
+  if (sigComment) msg += `💬 *Comentário:* ${safeStr(sigComment, 900)}\n`;
+
+  if (officeAt) msg += `\n🕒 officeSignaledAt(ms): \`${officeAt}\`\n`;
+  if (createdAt) msg += `🕒 createdAt(ms): \`${createdAt}\`\n`;
 
   return msg;
 }
 
 function buttons(taskId) {
+  // Ações canon do seu app
   return Markup.inlineKeyboard([
-    [Markup.button.callback("✅ concluir", `act|concluido|${taskId}`)],
-    [Markup.button.callback("⏳ pendente", `act|pendente|${taskId}`)],
-    [Markup.button.callback("🚫 deu ruim", `act|deu_ruim|${taskId}`)],
-    [Markup.button.callback("💬 responder", `act|comentario|${taskId}`)],
+    [
+      Markup.button.callback("✅ FEITO", `act|feito|${taskId}`),
+      Markup.button.callback("🧾 FEITO (det.)", `act|feito_detalhes|${taskId}`),
+    ],
+    [Markup.button.callback("⏳ PENDENTE", `act|pendente|${taskId}`)],
+    [Markup.button.callback("🚫 DEU RUIM", `act|deu_ruim|${taskId}`)],
+    [Markup.button.callback("💬 COMENTAR", `act|comentario|${taskId}`)],
   ]);
 }
 
@@ -80,10 +152,19 @@ async function callMasterRespond({ taskId, action, note, telegramMessageId }) {
   return json;
 }
 
+function isMasterChat(ctx) {
+  // MASTER_CHAT_ID pode ser string; ctx.chat.id é number
+  return String(ctx?.chat?.id || "") === String(MASTER_CHAT_ID);
+}
+
 // -----------------------------------------
 // 1) Comando /start
 // -----------------------------------------
 bot.start(async (ctx) => {
+  if (!isMasterChat(ctx)) {
+    await ctx.reply("🚫 Acesso restrito.");
+    return;
+  }
   await ctx.reply("✅ Master bot online. Vou te avisar quando o escritório sinalizar tarefas.");
 });
 
@@ -94,15 +175,25 @@ const pendingReply = new Map(); // chatId -> { taskId, action }
 
 bot.on("callback_query", async (ctx) => {
   try {
+    if (!isMasterChat(ctx)) {
+      await ctx.answerCbQuery("Acesso restrito.", { show_alert: true }).catch(() => {});
+      return;
+    }
+
     const data = ctx.callbackQuery?.data || "";
     if (!data.startsWith("act|")) return;
 
     const [, action, taskId] = data.split("|");
-    await ctx.answerCbQuery();
+    await ctx.answerCbQuery().catch(() => {});
+
+    if (!taskId) {
+      await ctx.reply("⚠️ Falha: taskId ausente.");
+      return;
+    }
 
     if (action === "comentario") {
       pendingReply.set(ctx.chat.id, { taskId, action });
-      await ctx.reply(`💬 Manda a mensagem de resposta para a tarefa \`${taskId}\` (vai registrar no painel).`, {
+      await ctx.reply(`💬 Envie a mensagem para registrar na tarefa \`${taskId}\``, {
         parse_mode: "Markdown",
       });
       return;
@@ -123,9 +214,11 @@ bot.on("callback_query", async (ctx) => {
 });
 
 // -----------------------------------------
-// 3) Texto após clicar “💬 responder”
+// 3) Texto após clicar “💬 comentar”
 // -----------------------------------------
 bot.on("text", async (ctx) => {
+  if (!isMasterChat(ctx)) return;
+
   const p = pendingReply.get(ctx.chat.id);
   if (!p) return;
 
@@ -139,7 +232,7 @@ bot.on("text", async (ctx) => {
       note,
     });
 
-    await ctx.reply(`💬 Resposta registrada na tarefa \`${p.taskId}\``, { parse_mode: "Markdown" });
+    await ctx.reply(`💬 Comentário registrado na tarefa \`${p.taskId}\``, { parse_mode: "Markdown" });
   } catch (e) {
     console.error("❌ master comment", e);
     await ctx.reply("🚨 Falha ao registrar comentário. Verifica logs.");
@@ -147,17 +240,19 @@ bot.on("text", async (ctx) => {
 });
 
 // -----------------------------------------
-// 4) Listener Firestore: dispara pro Master quando sinal muda
+// 4) Listener Firestore: dispara pro Master quando OFFICE sinalizar
 // -----------------------------------------
 function startTaskListener() {
-  // Heurística simples: monitora tarefas “aberta” e manda quando officeSignal muda
-  // Para produção, você pode refinar com campo "notifiedMasterAt" ou fila/outbox.
-  const ref = db.collection("tasks").orderBy("createdAt", "desc").limit(50);
+  // Observa as últimas tarefas; para não perder sinais muito antigos, aumente o limit.
+  const ref = db.collection("tasks").orderBy("createdAt", "desc").limit(200);
 
   let ready = false;
+
+  // Cache dedupe: taskId -> lastHash
+  const lastHashByTask = new Map();
+
   ref.onSnapshot(
     async (snap) => {
-      // evitar spam no boot
       if (!ready) {
         ready = true;
         return;
@@ -168,11 +263,29 @@ function startTaskListener() {
 
         const doc = ch.doc;
         const taskId = doc.id;
-        const data = doc.data();
+        const data = doc.data() || {};
 
-        // manda pro master quando houver sinal do office e status ainda não concluído
-        const status = data.status || "aberta";
-        if (status === "concluido") continue;
+        // Não notifica se já estiver fechado
+        if (isClosedStatus(data.status)) continue;
+
+        // Só notifica quando houver sinal real do escritório
+        const sig = normalizeOfficeSignal(data.officeSignal);
+        const officeAtMs = toMs(data.officeSignaledAt);
+        const hasSignal = Boolean(sig.state) || Boolean(sig.comment) || Boolean(officeAtMs);
+        if (!hasSignal) continue;
+
+        // Dedupe: evita notificar em qualquer alteração que não seja sinal novo
+        const hash = [
+          taskId,
+          String(officeAtMs || 0),
+          safeStr(sig.state, 80),
+          safeStr(sig.comment, 200),
+          safeStr(data.officeComment || "", 200),
+        ].join("|");
+
+        const prevHash = lastHashByTask.get(taskId) || "";
+        if (hash === prevHash) continue;
+        lastHashByTask.set(taskId, hash);
 
         const text = taskText(taskId, data);
 

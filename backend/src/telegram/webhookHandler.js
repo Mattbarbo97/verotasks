@@ -121,8 +121,6 @@ function hitRateLimit(key, minIntervalMs) {
 // Inline Keyboard
 // =========================================================
 function buildPriorityKeyboard(taskId) {
-  // callback_data limitado (<=64 bytes). vamos usar formato curto.
-  // "pr:<taskId>:<prio>"
   return {
     inline_keyboard: [
       [
@@ -138,7 +136,6 @@ function buildPriorityKeyboard(taskId) {
 }
 
 function parsePriorityCallback(data) {
-  // "pr:<taskId>:<prio>"
   const t = safeText(data);
   const m = t.match(/^pr:([^:]+):(baixa|media|alta|urgente)$/i);
   if (!m) return null;
@@ -216,7 +213,6 @@ async function handleUpdate(tg, cfg, req, res) {
       const cq = update.callback_query;
       const cqId = cq.id;
       const data = cq.data;
-      const from = cq.from || {};
       const msg = cq.message || {};
       const chatId = msg?.chat?.id;
       const messageId = msg?.message_id;
@@ -228,7 +224,6 @@ async function handleUpdate(tg, cfg, req, res) {
         return res.json({ ok: true });
       }
 
-      // LOCK ON: precisa estar vinculado
       if (lockOn) {
         const linked = await isChatLinked(usersCol, chatId);
         if (!linked) {
@@ -248,16 +243,15 @@ async function handleUpdate(tg, cfg, req, res) {
         return res.json({ ok: true });
       }
 
-      // feedback imediato
       await tgAnswerCallback(tg, cqId, `Prioridade: ${badge}`, false);
 
-      // edita a mensagem original do bot para refletir a prioridade escolhida
       if (chatId && messageId) {
         const editedText =
           `✅ Recebido! Já enviei para o escritório.\n\n` +
           `📌 Prioridade: ${badge}\n` +
           `🧾 Protocolo: ${parsed.taskId}\n\n` +
           `Toque para alterar:`;
+
         await tgEdit(tg, chatId, messageId, editedText, {
           reply_markup: buildPriorityKeyboard(parsed.taskId),
         }).catch(() => {});
@@ -284,10 +278,8 @@ async function handleUpdate(tg, cfg, req, res) {
     const chatId = msg?.chat?.id;
     const fromId = msg?.from?.id;
     const rawText = safeText(msg?.text);
-
     if (!chatId) return res.json({ ok: true });
 
-    // help
     if (rawText === "/start" || rawText === "/help") {
       await tgSend(
         tg,
@@ -298,7 +290,6 @@ async function handleUpdate(tg, cfg, req, res) {
       return res.json({ ok: true });
     }
 
-    // anti flood
     if (fromId && hitRateLimit(`u:${fromId}`, 2500)) {
       await tgSend(tg, chatId, "⏳ Aguarde 2s e tente novamente.");
       if (updateId) await setUpdateStatus(telegramUpdatesCol, updateId, { status: "rate_limited" });
@@ -367,7 +358,6 @@ async function handleUpdate(tg, cfg, req, res) {
       }
     }
 
-    // fallback /p (mantém compat)
     const parsedCmd = parsePriorityFromCommand(rawText);
     const pr = normalizePriority(parsedCmd.priority || detectPriorityFromText(parsedCmd.cleanText));
     const finalText = safeText(parsedCmd.cleanText) || safeText(rawText) || "(sem texto)";
@@ -384,7 +374,6 @@ async function handleUpdate(tg, cfg, req, res) {
       telegramChatId: chatId,
     };
 
-    // cria task
     let createdId = null;
 
     if (tasksCol) {
@@ -424,7 +413,6 @@ async function handleUpdate(tg, cfg, req, res) {
       createdId = docRef?.id || null;
     }
 
-    // Notifica master/office
     const badge = priorityBadge(pr);
     const payloadHtml =
       `📩 <b>${badge}</b>\n` +
@@ -436,16 +424,24 @@ async function handleUpdate(tg, cfg, req, res) {
     if (masterChatId) await tgSend(tg, masterChatId, payloadHtml, { parse_mode: "HTML" });
     if (officeChatId) await tgSend(tg, officeChatId, payloadHtml, { parse_mode: "HTML" });
 
-    // responde usuário com botões (prioridade)
     const reply =
       `✅ Recebido! Já enviei para o escritório.\n\n` +
       `📌 Prioridade: ${badge}\n` +
       (createdId ? `🧾 Protocolo: ${createdId}\n\n` : "\n") +
       `Toque para alterar:`;
 
-    await tgSend(tg, chatId, reply, {
-      reply_markup: buildPriorityKeyboard(createdId || "noid"),
-    });
+    // ✅ Só envia botões se tem protocolo
+    if (createdId) {
+      await tgSend(tg, chatId, reply, {
+        reply_markup: buildPriorityKeyboard(createdId),
+      });
+    } else {
+      await tgSend(
+        tg,
+        chatId,
+        reply + "\n⚠️ Não consegui gerar o protocolo agora. Tente novamente em instantes."
+      );
+    }
 
     if (updateId) {
       await setUpdateStatus(telegramUpdatesCol, updateId, {
