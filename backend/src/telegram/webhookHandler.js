@@ -117,6 +117,11 @@ function hitRateLimit(key, minIntervalMs) {
   return false;
 }
 
+// HTML escape (Telegram parse_mode HTML)
+function escHtml(s) {
+  return safeText(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 // =========================================================
 // Inline Keyboard
 // =========================================================
@@ -140,6 +145,14 @@ function parsePriorityCallback(data) {
   const m = t.match(/^pr:([^:]+):(baixa|media|alta|urgente)$/i);
   if (!m) return null;
   return { taskId: m[1], priority: normalizePriority(m[2]) };
+}
+
+// ✅ Novos botões de decisão do Master
+function parseDecisionCallback(data) {
+  const t = safeText(data);
+  const m = t.match(/^decide:(close|reopen|ask|view):(.+)$/i);
+  if (!m) return null;
+  return { action: String(m[1]).toLowerCase(), taskId: String(m[2]).trim() };
 }
 
 // =========================================================
@@ -174,6 +187,63 @@ async function updateTaskPriority(tasksCol, taskId, newPriority) {
 
   await ref.set({ priority: newPriority, updatedAt: nowTS() }, { merge: true });
   return { ok: true, taskId: String(taskId) };
+}
+
+async function getTask(tasksCol, taskId) {
+  if (!tasksCol || !taskId) return { ok: false, reason: "missing_args" };
+  const ref = tasksCol.doc(String(taskId));
+  const snap = await ref.get();
+  if (!snap.exists) return { ok: false, reason: "not_found" };
+  return { ok: true, ref, task: { id: snap.id, ...snap.data() } };
+}
+
+function taskTitle(task) {
+  return (
+    safeText(task?.title) ||
+    safeText(task?.telegram?.title) ||
+    safeText(task?.description) ||
+    safeText(task?.message) ||
+    "(sem título)"
+  );
+}
+
+function decisionResultText(action, title) {
+  if (action === "close") return `✅ <b>Decisão do Master:</b>\nA tarefa <b>${escHtml(title)}</b> foi <b>FECHADA</b>.`;
+  if (action === "reopen") return `↩️ <b>Decisão do Master:</b>\nA tarefa <b>${escHtml(title)}</b> foi <b>REABERTA</b>.`;
+  if (action === "ask") return `❓ <b>Decisão do Master:</b>\nSolicitados <b>mais detalhes</b> sobre <b>${escHtml(title)}</b>.`;
+  return `✅ OK`;
+}
+
+function fmtTaskDetailsHTML(task) {
+  const id = escHtml(task?.id);
+  const title = escHtml(taskTitle(task));
+  const status = escHtml(task?.status || "—");
+  const prio = escHtml(task?.priority || task?.telegram?.priority || "—");
+  const src = escHtml(task?.source || "—");
+  const from = escHtml(task?.createdBy?.name || task?.by?.name || "—");
+
+  const officeState =
+    task?.officeSignal && typeof task.officeSignal === "object"
+      ? escHtml(task.officeSignal.state || "—")
+      : escHtml(task?.officeSignal || "—");
+
+  const officeComment =
+    task?.officeSignal && typeof task.officeSignal === "object"
+      ? escHtml(task.officeSignal.comment || "")
+      : escHtml(task?.officeComment || "");
+
+  const lines = [];
+  lines.push(`<b>🧾 Detalhes da tarefa</b>`);
+  lines.push(`<b>Título:</b> ${title}`);
+  lines.push(`<b>Status:</b> ${status}`);
+  lines.push(`<b>Prioridade:</b> ${prio}`);
+  lines.push(`<b>De:</b> ${from}`);
+  lines.push(`<b>Fonte:</b> ${src}`);
+  lines.push(`<b>Office signal:</b> ${officeState}`);
+  if (officeComment) lines.push(`<b>Comentário office:</b> ${officeComment}`);
+  lines.push(``);
+  lines.push(`<b>ID:</b> <code>${id}</code>`);
+  return lines.join("\n");
 }
 
 // =========================================================
@@ -217,6 +287,118 @@ async function handleUpdate(tg, cfg, req, res) {
       const chatId = msg?.chat?.id;
       const messageId = msg?.message_id;
 
+      // 🔹 Primeiro: trata DECISÃO do master
+      const decide = parseDecisionCallback(data);
+      if (decide) {
+        // Só o masterChatId pode decidir (mais seguro/objetivo)
+        if (!masterChatId || String(chatId) !== String(masterChatId)) {
+          await tgAnswerCallback(tg, cqId, "Somente o Master pode decidir.", true);
+          if (updateId) await setUpdateStatus(telegramUpdatesCol, updateId, { status: "callback_decide_not_master" });
+          return res.json({ ok: true });
+        }
+
+        // (Opcional) se AUTH_LOCK estiver ON, ainda assim masterChatId passa (e não depende de /link)
+        // Se quiser obrigar link do master, eu ajusto depois.
+
+        const got = await getTask(tasksCol, decide.taskId);
+        if (!got.ok) {
+          await tgAnswerCallback(tg, cqId, "Não encontrei a tarefa.", true);
+          if (updateId) await setUpdateStatus(telegramUpdatesCol, updateId, { status: "callback_decide_task_not_found" });
+          return res.json({ ok: true });
+        }
+
+        const { ref, task } = got;
+        const title = taskTitle(task);
+
+        const from = cq?.from || {};
+        const by = {
+          uid: from?.id ? `tg:${from.id}` : "tg:unknown",
+          name: from?.username ? `@${from.username}` : safeText(from?.first_name || "master"),
+          email: null,
+          source: "telegram",
+          telegramUserId: from?.id || null,
+          telegramChatId: chatId || null,
+        };
+
+        // Ação: view (somente manda detalhes e mantém botões)
+        if (decide.action === "view") {
+          await tgAnswerCallback(tg, cqId, "Enviando detalhes…", false);
+
+          await tgSend(tg, chatId, fmtTaskDetailsHTML(task), {
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+          }).catch(() => {});
+
+          // Mantém a mensagem original como está (não remove botões)
+          if (updateId) {
+            await setUpdateStatus(telegramUpdatesCol, updateId, {
+              status: "callback_decide_view",
+              taskId: decide.taskId,
+              ms: Date.now() - t0,
+            });
+          }
+
+          return res.json({ ok: true });
+        }
+
+        // Atualizações de decisão
+        const patch = {
+          updatedAt: nowTS(),
+          updatedBy: by,
+          audit: (task.audit || []).concat([
+            {
+              action: "master_decision",
+              at: nowTS(),
+              by: { userId: by.uid, name: by.name },
+              meta: { decision: decide.action },
+            },
+          ]),
+        };
+
+        if (decide.action === "close") {
+          patch.status = "feito"; // ✅ ajuste se quiser "feito_detalhes" etc
+          patch.masterDecidedAt = nowTS();
+          patch.masterDecision = { action: "close", by, at: nowTS() };
+        } else if (decide.action === "reopen") {
+          patch.status = "aberta";
+          patch.masterDecidedAt = nowTS();
+          patch.masterDecision = { action: "reopen", by, at: nowTS() };
+        } else if (decide.action === "ask") {
+          patch.masterAskedDetailsAt = nowTS();
+          patch.masterAskedDetailsBy = by;
+          patch.masterDecision = { action: "ask", by, at: nowTS() };
+        } else {
+          await tgAnswerCallback(tg, cqId, "Ação não suportada.", true);
+          if (updateId) await setUpdateStatus(telegramUpdatesCol, updateId, { status: "callback_decide_unknown" });
+          return res.json({ ok: true });
+        }
+
+        await ref.set(patch, { merge: true });
+
+        await tgAnswerCallback(tg, cqId, "OK ✅", false);
+
+        // Edita a mensagem original, removendo botões (para close/reopen/ask)
+        if (chatId && messageId) {
+          const edited = decisionResultText(decide.action, title);
+          await tgEdit(tg, chatId, messageId, edited, {
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+            reply_markup: { inline_keyboard: [] }, // remove teclado
+          }).catch(() => {});
+        }
+
+        if (updateId) {
+          await setUpdateStatus(telegramUpdatesCol, updateId, {
+            status: `callback_decide_${decide.action}`,
+            taskId: decide.taskId,
+            ms: Date.now() - t0,
+          });
+        }
+
+        return res.json({ ok: true });
+      }
+
+      // 🔹 Depois: trata PRIORIDADE (fluxo atual)
       const parsed = parsePriorityCallback(data);
       if (!parsed) {
         await tgAnswerCallback(tg, cqId, "Comando inválido.", false);
@@ -416,10 +598,10 @@ async function handleUpdate(tg, cfg, req, res) {
     const badge = priorityBadge(pr);
     const payloadHtml =
       `📩 <b>${badge}</b>\n` +
-      `<b>Tarefa:</b> ${title}\n` +
-      `<b>De:</b> ${userLabel}\n\n` +
-      `<b>Mensagem:</b>\n${finalText}\n` +
-      (createdId ? `\n<b>ID:</b> <code>${createdId}</code>\n` : "");
+      `<b>Tarefa:</b> ${escHtml(title)}\n` +
+      `<b>De:</b> ${escHtml(userLabel)}\n\n` +
+      `<b>Mensagem:</b>\n${escHtml(finalText)}\n` +
+      (createdId ? `\n<b>ID:</b> <code>${escHtml(createdId)}</code>\n` : "");
 
     if (masterChatId) await tgSend(tg, masterChatId, payloadHtml, { parse_mode: "HTML" });
     if (officeChatId) await tgSend(tg, officeChatId, payloadHtml, { parse_mode: "HTML" });

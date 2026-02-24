@@ -1,11 +1,16 @@
 // backend/src/routes/telegram.js
+/* eslint-disable */
 const express = require("express");
-const { createTelegramClient } = require("../telegram/client");
 const { handleUpdate } = require("../telegram/webhookHandler");
 
-function telegramRouter(cfg) {
+function telegramRouter(cfg, deps) {
   const router = express.Router();
-  const tg = createTelegramClient(cfg);
+
+  // ✅ usa o tgClient já criado no index.js
+  const tg = deps?.tgClient;
+  if (!tg) {
+    throw new Error("telegramRouter: missing deps.tgClient");
+  }
 
   // Webhook do Telegram (messages + callback_query)
   router.post("/webhook", async (req, res) => {
@@ -20,10 +25,13 @@ function telegramRouter(cfg) {
       }
 
       const url = `${cfg.BASE_URL}/telegram/webhook`;
+
+      // ✅ tg é axios instance, então tg.post funciona
       const { data } = await tg.post("/setWebhook", {
         url,
         secret_token: cfg.TELEGRAM_WEBHOOK_SECRET,
       });
+
       return res.json(data);
     } catch (e) {
       return res.status(500).json({ ok: false, error: e?.message });

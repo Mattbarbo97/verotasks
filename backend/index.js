@@ -1,4 +1,5 @@
 // backend/index.js
+/* eslint-disable */
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -69,6 +70,8 @@ initFn(cfg);
 // ============================
 const { createTelegramClient } = require("./src/telegram/client");
 const tgClient = createTelegramClient(cfg);
+
+// deps compartilhadas para rotas/workers
 const deps = { tgClient };
 
 // ============================
@@ -105,7 +108,6 @@ const officeRouter = require("./src/routes/office");
 const { adminRouter } = require("./src/routes/admin");
 
 // telegram.js exporta: module.exports = { telegramRouter }
-// ⚠️ IMPORTANTE: passe deps se o telegram router usa tgClient internamente
 const { telegramRouter } = require("./src/routes/telegram");
 
 // master.js exporta: module.exports = function masterRouter(cfg, deps)
@@ -126,7 +128,7 @@ app.use("/master", masterRouter(cfg, deps));
 app.use("/admin", adminRouter(cfg));
 
 // Telegram (webhook + consume-link-token)
-app.use("/telegram", telegramRouter(cfg, deps)); // ✅ antes estava sem deps
+app.use("/telegram", telegramRouter(cfg, deps)); // ✅ garante deps aqui
 
 // ============================
 // Worker: Firestore -> Telegram (office outbox)
@@ -145,7 +147,7 @@ const server = app.listen(PORT, () => {
   console.log("→ BASE_URL:", cfg.BASE_URL || "(missing)");
   console.log("→ MASTER_CHAT_ID:", cfg.MASTER_CHAT_ID || "(missing)");
   console.log("→ OFFICE_CHAT_ID:", cfg.OFFICE_CHAT_ID || "(missing)");
-  console.log("→ AUTH_LOCK:", cfg.AUTH_LOCK === "ON" ? "ON" : "OFF");
+  console.log("→ AUTH_LOCK:", String(cfg.AUTH_LOCK || "").toUpperCase() === "ON" ? "ON" : "OFF");
   console.log("→ FIREBASE_ADMIN:", cfg._SERVICE_ACCOUNT_JSON ? "OK" : "MISSING");
 
   // ✅ inicia watcher
