@@ -25,11 +25,6 @@ module.exports = function startTelegramOfficeWatcher(cfg, deps) {
     return String(v ?? "");
   }
 
-  function isClosedStatus(s) {
-    const v = String(s || "");
-    return ["feito", "feito_detalhes", "deu_ruim"].includes(v);
-  }
-
   function normalizeOfficeState(officeSignal) {
     if (!officeSignal) return "";
     if (typeof officeSignal === "string") return officeSignal;
@@ -66,8 +61,12 @@ module.exports = function startTelegramOfficeWatcher(cfg, deps) {
       .replace(/>/g, "&gt;");
   }
 
+  function isClosedStatus(s) {
+    const v = String(s || "");
+    return ["feito", "feito_detalhes", "deu_ruim"].includes(v);
+  }
+
   function buildDecisionKeyboard(taskId) {
-    // Botões para o master decidir via callback_query
     return {
       inline_keyboard: [
         [
@@ -123,6 +122,21 @@ module.exports = function startTelegramOfficeWatcher(cfg, deps) {
       lines.push(`👉 <b>Decida:</b> usar os botões abaixo.`);
     }
 
+    return lines.join("\n");
+  }
+
+  function fmtRequesterExecutedHTML(task) {
+    const preview = escHtml(taskPreview(task));
+    const taskId = escHtml(task.id);
+    const lines = [];
+    lines.push(`🏢 <b>Atualização do Escritório</b>`);
+    lines.push(`✅ Sua tarefa foi marcada como <b>concluída</b>:`);
+    lines.push(``);
+    lines.push(`${preview}`);
+    lines.push(``);
+    lines.push(`🧾 Protocolo: <code>${taskId}</code>`);
+    lines.push(``);
+    lines.push(`⏳ Aguardando decisão final do Master.`);
     return lines.join("\n");
   }
 
@@ -232,7 +246,6 @@ module.exports = function startTelegramOfficeWatcher(cfg, deps) {
       {
         telegramOutbox: {
           lastError: safeStr(errMsg).slice(0, 400),
-          // mantém deliveredAt = null pra tentar novamente
         },
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
@@ -241,11 +254,6 @@ module.exports = function startTelegramOfficeWatcher(cfg, deps) {
   }
 
   async function fetchPendingTasks() {
-    // ✅ Puxa APENAS pendentes
-    // Requer que, ao sinalizar, você set:
-    // telegramOutbox.kind="office_signal"
-    // telegramOutbox.requestedAt=serverTimestamp()
-    // telegramOutbox.deliveredAt=null
     const snap = await TASKS
       .where("telegramOutbox.kind", "==", "office_signal")
       .where("telegramOutbox.deliveredAt", "==", null)
@@ -261,8 +269,90 @@ module.exports = function startTelegramOfficeWatcher(cfg, deps) {
   function needsDelivery(task) {
     const rev = Number(task.telegramOutbox?.revision || 0);
     const del = Number(task.telegramOutbox?.deliveredRevision || 0);
-    // deliveredAt null é o principal, mas mantemos rev/del como proteção extra:
     return Boolean(task.telegramOutbox?.deliveredAt == null) && rev > del;
+  }
+
+  // ✅ Dedupe: envia pro solicitante só 1x quando tarefa_executada
+  async function notifyRequesterExecutedOnce(fresh) {
+    const state = normalizeOfficeState(fresh.officeSignal);
+    if (state !== "tarefa_executada") return;
+
+    // se já fechada, não precisa incomodar solicitante
+    if (isClosedStatus(fresh.status)) return;
+
+    const requesterChatId = fresh?.telegram?.chatId;
+    if (!requesterChatId) return;
+
+    const ref = TASKS.doc(fresh.id);
+    const lockKey = "telegramNotifs.requester.executedAt";
+
+    let shouldSend = false;
+
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return;
+      const d = snap.data() || {};
+
+      // já enviado?
+      const already = d?.telegramNotifs?.requester?.executedAt;
+      if (already) return;
+
+      tx.set(
+        ref,
+        {
+          telegramNotifs: {
+            ...(d.telegramNotifs || {}),
+            requester: {
+              ...((d.telegramNotifs && d.telegramNotifs.requester) || {}),
+              executedAt: admin.firestore.FieldValue.serverTimestamp(),
+              executedChatId: String(requesterChatId),
+            },
+          },
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      shouldSend = true;
+    });
+
+    if (!shouldSend) return;
+
+    try {
+      const sent = await tgClient.sendMessage(String(requesterChatId), fmtRequesterExecutedHTML(fresh), {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+
+      const msgId = sent?.message_id || sent?.messageId || null;
+      if (msgId) {
+        await ref.set(
+          {
+            telegramNotifs: {
+              requester: {
+                executedMsgId: Number(msgId),
+              },
+            },
+          },
+          { merge: true }
+        );
+      }
+    } catch (e) {
+      // Não falha o outbox do master por causa do solicitante
+      // (Se quiser retry disso depois, dá pra criar outro outbox, mas por ora mantém seguro)
+      try {
+        await ref.set(
+          {
+            telegramNotifs: {
+              requester: {
+                executedErr: safeStr(e?.message || e).slice(0, 250),
+              },
+            },
+          },
+          { merge: true }
+        );
+      } catch {}
+    }
   }
 
   async function tick() {
@@ -274,7 +364,6 @@ module.exports = function startTelegramOfficeWatcher(cfg, deps) {
 
       for (const task of rows) {
         if (!task?.id) continue;
-
         if (!needsDelivery(task)) continue;
 
         const okClaim = await claimTaskForProcessing(task.id);
@@ -297,13 +386,14 @@ module.exports = function startTelegramOfficeWatcher(cfg, deps) {
           const sigRaw = normalizeOfficeState(fresh.officeSignal);
           const htmlText = fmtTaskTelegramTextHTML(fresh);
 
-          // ✅ Se for tarefa executada: manda com botões (para decisão do master)
-          // ✅ Se já estiver fechada, ainda pode mandar o sinal (sem botões) só pra registro.
+          // ✅ Envia ao solicitante quando "tarefa_executada" (sem quebrar nada)
+          await notifyRequesterExecutedOnce(fresh);
+
+          // ✅ Master: botões só se tarefa_executada e não fechada ainda
           let sendOptions = {};
           if (sigRaw === "tarefa_executada" && !isClosedStatus(fresh.status)) {
             sendOptions.reply_markup = buildDecisionKeyboard(fresh.id);
           } else {
-            // se não for executada (ou já fechada), não envia botões
             sendOptions.reply_markup = undefined;
           }
 
